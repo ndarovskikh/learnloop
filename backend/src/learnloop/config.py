@@ -41,6 +41,7 @@ class Settings:
     memory_db_path: Optional[Path] = None
     memory_jsonl_path: Optional[Path] = None
     coach_rules_path: Optional[Path] = None
+    admin_token: str = ""
 
     @property
     def has_real_api_key(self) -> bool:
@@ -64,4 +65,5 @@ class Settings:
             memory_db_path=root / "data" / "learnloop.sqlite3",
             memory_jsonl_path=root / "data" / "learning_memories.jsonl",
             coach_rules_path=root / "coach_rules.md",
+            admin_token=_value("LEARNLOOP_ADMIN_TOKEN", env_file, ""),
         )

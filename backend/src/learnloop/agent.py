@@ -13,6 +13,7 @@ from .models import (
 )
 from .repository import ProgressRepository
 from .tools import ToolRegistry
+from .admin_agent import AdminStatisticsAgent
 
 
 def _question_from_result(data: Dict[str, Any]) -> Question:
@@ -31,12 +32,36 @@ class AgentLoop:
         registry: ToolRegistry,
         repository: ProgressRepository,
         max_steps: int = 12,
+        admin_agent: Optional[AdminStatisticsAgent] = None,
     ):
         if max_steps < 1:
             raise ValueError("max_steps must be positive")
         self.registry = registry
         self.repository = repository
         self.max_steps = max_steps
+        self.admin_agent = admin_agent
+
+    def handle_chat_message(self, user_id: str, message: str) -> Optional[str]:
+        """Route only self-service ranking questions to the privileged helper.
+
+        The ordinary agent never receives cohort data. It can request the
+        admin helper to calculate the current user's own aggregate position.
+        """
+        normalized = message.lower()
+        statistics_words = ("перцентил", "процентиль", "топ", "рейтинг", "место среди", "percentile", "top ", "ranking")
+        if not any(word in normalized for word in statistics_words):
+            return None
+        if any(word in normalized for word in ("другого студента", "другого пользователя", "other student", "another user")):
+            return "Я могу показать только вашу собственную обезличенную позицию в группе."
+        if self.admin_agent is None:
+            return "Сравнительная статистика сейчас недоступна."
+        try:
+            result = self.admin_agent.benchmark(user_id)
+        except ValueError as exc:
+            if str(exc) == "INSUFFICIENT_COHORT":
+                return "Пока недостаточно участников для безопасного сравнения."
+            return "Пока нет достаточно ваших результатов для расчёта позиции."
+        return result["message"]
 
     @staticmethod
     def _signature(name: str, arguments: Dict[str, Any]) -> str:
@@ -294,4 +319,3 @@ class AgentLoop:
             progress=progress,
             allowed_actions=actions,
         )
-
