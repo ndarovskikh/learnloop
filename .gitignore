@@ -9,6 +9,8 @@ __pycache__/
 # Runtime state and local/copyrighted materials
 backend/data/progress/*.json
 backend/data/materials/*.pdf
+backend/data/learnloop.sqlite3
+backend/data/learning_memories.jsonl
 
 # Frontend build artifacts
 frontend/node_modules/

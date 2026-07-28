@@ -102,6 +102,16 @@ are `retrieve_learning_memory`, `get_topic_mastery`, `get_previous_attempts`,
 and `get_course_material`; each student-memory request is scoped to its own
 `user_id`.
 
+### Admin statistics agent
+
+The privileged `AdminStatisticsAgent` can calculate only an authenticated
+student's anonymized course or topic percentile. Configure
+`LEARNLOOP_ADMIN_TOKEN` in `backend/.env`, then call
+`POST /api/admin/benchmark` with an `X-Admin-Token` header. It is disabled by
+default, is not available to the ordinary coaching tools, and refuses cohorts
+smaller than two. The full privacy boundary is in
+[`docs/admin-agent-boundary.md`](docs/admin-agent-boundary.md).
+
 ## 3. Install all backend dependencies
 
 Create an isolated Python environment:

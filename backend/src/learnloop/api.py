@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -15,6 +15,8 @@ from .config import Settings
 from .models import CheckpointDecision, Question, TopicStatus
 from .question_bank import QuestionBank
 from .repository import ProgressRepository
+from .admin_agent import AdminStatisticsAgent
+from .memory_store import LearningMemoryStore
 
 
 COURSE_ID = "ddia"
@@ -74,6 +76,11 @@ class TopicSelectionRequest(BaseModel):
     topic: str = Field(min_length=1, max_length=120)
 
 
+class AdminBenchmarkRequest(BaseModel):
+    user_id: str = Field(min_length=1, max_length=80)
+    topic: Optional[str] = Field(default=None, min_length=1, max_length=120)
+
+
 def _question_payload(question: Optional[Question]) -> Optional[Dict[str, Any]]:
     return question.to_dict() if question else None
 
@@ -88,6 +95,12 @@ def create_app(
     repository = repository or ProgressRepository(settings.progress_dir)
     question_bank = question_bank or QuestionBank(settings.question_bank_path)
     agent = agent or build_agent(settings)
+    admin_agent = None
+    if settings.memory_db_path and settings.memory_jsonl_path:
+        admin_agent = AdminStatisticsAgent(
+            LearningMemoryStore(settings.memory_db_path, settings.memory_jsonl_path)
+        )
+    agent.admin_agent = admin_agent
 
     app = FastAPI(
         title="LearnLoop API",
@@ -209,6 +222,22 @@ def create_app(
     def health() -> Dict[str, str]:
         return {"status": "ok"}
 
+    @app.post("/api/admin/benchmark")
+    def admin_benchmark(
+        request: AdminBenchmarkRequest,
+        x_admin_token: Optional[str] = Header(default=None),
+    ) -> Dict[str, Any]:
+        if not settings.admin_token:
+            raise HTTPException(status_code=503, detail="Admin statistics are disabled")
+        if x_admin_token != settings.admin_token:
+            raise HTTPException(status_code=403, detail="Admin access required")
+        if admin_agent is None:
+            raise HTTPException(status_code=503, detail="Admin statistics are unavailable")
+        try:
+            return admin_agent.benchmark(request.user_id, request.topic)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     @app.post("/api/auth/login")
     def login(request: LoginRequest) -> Dict[str, str]:
         username = request.username.strip().lower()
@@ -248,6 +277,16 @@ def create_app(
         request: ChatRequest,
     ) -> Dict[str, Any]:
         require_course(course_id)
+        admin_reply = agent.handle_chat_message(request.user_id, request.message)
+        if admin_reply is not None:
+            workspace = course_workspace(request.user_id)
+            workspace["history"].extend(
+                [
+                    {"id": "admin-question", "role": "user", "content": request.message},
+                    {"id": "admin-reply", "role": "assistant", "content": admin_reply},
+                ]
+            )
+            return workspace
         result = agent.submit_answer(
             user_id=request.user_id,
             question_id=request.question_id,
