@@ -76,6 +76,10 @@ class TopicSelectionRequest(BaseModel):
     topic: str = Field(min_length=1, max_length=120)
 
 
+class PracticeQuestionsRequest(BaseModel):
+    user_id: str = Field(min_length=1, max_length=80)
+
+
 class AdminBenchmarkRequest(BaseModel):
     user_id: str = Field(min_length=1, max_length=80)
     topic: Optional[str] = Field(default=None, min_length=1, max_length=120)
@@ -144,7 +148,9 @@ def create_app(
                 CheckpointDecision.MARK_MASTERED.value,
                 CheckpointDecision.NEEDS_REVIEW.value,
             ]
-            if not progress.extra_iteration_used:
+            if agent.registry.tools.question_generation_agent is not None:
+                allowed.insert(1, "generate_more_questions")
+            elif not progress.extra_iteration_used:
                 allowed.insert(1, CheckpointDecision.ONE_MORE_QUESTION.value)
             checkpoint = {
                 "message": (
@@ -315,6 +321,26 @@ def create_app(
                 detail={
                     "code": result.error_code,
                     "message": result.message,
+                },
+            )
+        return course_workspace(request.user_id)
+
+    @app.post("/api/courses/{course_id}/practice-questions")
+    def generate_practice_questions(
+        course_id: str,
+        request: PracticeQuestionsRequest,
+    ) -> Dict[str, Any]:
+        require_course(course_id)
+        result = agent.registry.execute(
+            "generate_personal_practice_questions",
+            {"user_id": request.user_id},
+        )
+        if not result.success:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": result.error_code,
+                    "message": result.error_message,
                 },
             )
         return course_workspace(request.user_id)

@@ -3,6 +3,7 @@ import { computed, nextTick, ref } from "vue";
 import {
   getCourse,
   getCourses,
+  generatePracticeQuestions,
   login,
   materialUrl,
   resetAllProgress,
@@ -220,6 +221,24 @@ async function chooseCheckpoint(decision) {
       user_id: userId.value,
       decision,
     });
+    visibleHistory.value = [...workspace.value.history];
+    scrollToLatest();
+  } catch (requestError) {
+    error.value = requestError.message;
+  } finally {
+    sending.value = false;
+  }
+}
+
+async function requestMorePractice() {
+  if (sending.value) return;
+  sending.value = true;
+  error.value = "";
+  try {
+    workspace.value = await generatePracticeQuestions(
+      selectedCourseId.value,
+      { user_id: userId.value },
+    );
     visibleHistory.value = [...workspace.value.history];
     scrollToLatest();
   } catch (requestError) {
@@ -505,6 +524,18 @@ function openMaterial(material) {
                 @click="chooseCheckpoint('mark_mastered')"
               >
                 Mark as mastered
+              </button>
+              <button
+                v-if="
+                  workspace.checkpoint.allowed_actions.includes(
+                    'generate_more_questions',
+                  )
+                "
+                class="secondary"
+                type="button"
+                @click="requestMorePractice"
+              >
+                Generate 5 practice questions
               </button>
               <button
                 v-if="

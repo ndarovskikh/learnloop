@@ -16,7 +16,9 @@ class LearningProvider(Protocol):
         topic: str,
         difficulty: Difficulty,
         knowledge_gaps: List[str],
-        source_context: str, context: str = "",
+        source_context: str,
+        context: str = "",
+        variation: int = 0,
     ) -> Question:
         ...
 
@@ -66,17 +68,27 @@ class HeuristicProvider:
         topic: str,
         difficulty: Difficulty,
         knowledge_gaps: List[str],
-        source_context: str, context: str = "",
+        source_context: str,
+        context: str = "",
+        variation: int = 0,
     ) -> Question:
         gap = knowledge_gaps[0] if knowledge_gaps else topic
         digest = hashlib.sha256(
-            ("%s:%s:%s" % (topic, difficulty.value, gap)).encode("utf-8")
+            ("%s:%s:%s:%s" % (topic, difficulty.value, gap, variation)).encode("utf-8")
         ).hexdigest()[:10]
+        prompts = (
+            "Explain %s in your own words and give one practical consequence.",
+            "Give a concrete example of %s and explain why it matters.",
+            "Describe a common misconception about %s and correct it.",
+            "Compare a system that handles %s well with one that does not.",
+            "Apply %s to a realistic design decision and justify your choice.",
+        )
+        prompt = prompts[(max(variation, 1) - 1) % len(prompts)]
         return Question(
             id="generated-%s" % digest,
             topic=topic,
             difficulty=difficulty,
-            text="Explain %s in your own words and give one practical consequence." % gap,
+            text=prompt % gap,
             expected_concepts=[gap],
             explanation="A correct answer should explain %s using the course material."
             % gap,
@@ -151,7 +163,9 @@ class OpenAIProvider:
         topic: str,
         difficulty: Difficulty,
         knowledge_gaps: List[str],
-        source_context: str, context: str = "",
+        source_context: str,
+        context: str = "",
+        variation: int = 0,
     ) -> Question:
         payload = self._json_call(
             system=(
@@ -166,6 +180,7 @@ class OpenAIProvider:
                     "difficulty": difficulty.value,
                     "knowledge_gaps": knowledge_gaps,
                     "source_context": source_context,
+                    "variation": variation,
                 },
                 ensure_ascii=False,
             ),
