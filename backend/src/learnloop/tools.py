@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from typing import Any, Dict, List
+import logging
+import sqlite3
+from typing import Any, Dict, List, Optional
 
 from .models import (
     Assessment,
@@ -12,6 +14,8 @@ from .models import (
     ToolResult,
     TopicStatus,
 )
+from .memory_store import LearningMemoryStore
+from .context import LearningContext
 from .provider import LearningProvider
 from .question_bank import QuestionBank
 from .repository import ProgressRepository
@@ -29,12 +33,61 @@ class LearningTools:
         provider: LearningProvider,
         max_topic_depth: int = 5,
         max_extra_iterations: int = 1,
+        memory_store: Optional[LearningMemoryStore] = None,
+        learning_context: Optional[LearningContext] = None,
     ):
         self.repository = repository
         self.question_bank = question_bank
         self.provider = provider
         self.max_topic_depth = max_topic_depth
         self.max_extra_iterations = max_extra_iterations
+        self.memory_store = memory_store
+        self.learning_context = learning_context
+
+    def _persist_learning_memory(
+        self,
+        user_id: str,
+        question,
+        assessment: Assessment,
+    ) -> None:
+        """Store durable facts after the main progress write has succeeded.
+
+        The historical progress JSON remains the current-session state during
+        this transition; SQLite is the durable event and analytics store.
+        A storage outage must not invalidate an answer that was already saved.
+        """
+        if self.memory_store is None:
+            return
+        try:
+            self.memory_store.seed_question(
+                course_id="ddia",
+                course_title="Designing Data-Intensive Applications",
+                topic_id=question.topic,
+                topic_title=question.topic.replace("_", " ").title(),
+                question_id=question.id,
+                difficulty=question.difficulty.value,
+                question_text=question.text,
+                expected_answer="; ".join(question.expected_concepts),
+            )
+            attempt_id = self.memory_store.record_attempt(
+                user_id=user_id,
+                user_name=user_id,
+                question_id=question.id,
+                score=assessment.score,
+            )
+            if assessment.knowledge_gaps:
+                gaps = ", ".join(assessment.knowledge_gaps)
+                self.memory_store.remember(
+                    user_id=user_id,
+                    type="learning_fact",
+                    content="Student needs practice with: %s." % gaps,
+                    cue=[question.topic, *assessment.knowledge_gaps],
+                    source={"question_id": question.id, "attempt_id": attempt_id},
+                )
+        except (OSError, sqlite3.Error, KeyError, ValueError) as exc:
+            logging.getLogger(__name__).warning(
+                "Learning memory was not persisted for %s: %s", user_id, exc
+            )
 
     def assess_and_record_answer(
         self,
@@ -66,7 +119,11 @@ class LearningTools:
                 "Resolve the topic checkpoint before another answer",
             )
         try:
-            assessment = self.provider.assess(question, student_answer)
+            push_context = (
+                self.learning_context.push(user_id, question)
+                if self.learning_context else ""
+            )
+            assessment = self.provider.assess(question, student_answer, push_context)
         except Exception as exc:
             return ToolResult.error("ASSESSMENT_FAILED", str(exc))
 
@@ -114,6 +171,8 @@ class LearningTools:
                 "PROGRESS_VERIFICATION_FAILED",
                 "Saved progress does not contain the expected attempt",
             )
+
+        self._persist_learning_memory(user_id, question, assessment)
 
         return ToolResult.ok(
             {
@@ -173,11 +232,19 @@ class LearningTools:
                         "NO_GROUNDED_SOURCE",
                         "No approved course source exists for topic %s" % topic,
                     )
+                push_context = (
+                    self.learning_context.push(user_id)
+                    if self.learning_context else ""
+                )
+                pulled = self.retrieve_learning_memory(
+                    user_id=user_id, topic=topic, limit=5
+                )
                 question = self.provider.generate_question(
                     topic=topic,
                     difficulty=difficulty,
                     knowledge_gaps=knowledge_gaps,
                     source_context=source_context,
+                    context=push_context + "\nPULLED LEARNING MEMORY: " + str(pulled.data if pulled.success else []),
                 )
                 if not question.expected_concepts or not question.source.strip():
                     return ToolResult.error(
@@ -255,6 +322,13 @@ class LearningTools:
             progress = self.repository.reset(user_id)
         except (OSError, ValueError) as exc:
             return ToolResult.error("RESET_FAILED", str(exc))
+        if self.memory_store:
+            try:
+                self.memory_store.reset_user(user_id)
+            except (OSError, sqlite3.Error, ValueError):
+                logging.getLogger(__name__).warning(
+                    "Structured learning memory was not reset for %s", user_id
+                )
         return ToolResult.ok({"progress": progress.to_dict()})
 
     def reset_topic_progress(
@@ -278,6 +352,13 @@ class LearningTools:
             progress = self.repository.reset_topic(user_id, topic)
         except (OSError, ValueError) as exc:
             return ToolResult.error("RESET_FAILED", str(exc))
+        if self.memory_store:
+            try:
+                self.memory_store.reset_topic(user_id, topic)
+            except (OSError, sqlite3.Error, ValueError):
+                logging.getLogger(__name__).warning(
+                    "Topic learning memory was not reset for %s", user_id
+                )
         return ToolResult.ok({"progress": progress.to_dict()})
 
     def select_learning_topic(
@@ -299,6 +380,26 @@ class LearningTools:
         except (OSError, ValueError) as exc:
             return ToolResult.error("TOPIC_SELECTION_FAILED", str(exc))
         return ToolResult.ok({"progress": verified.to_dict()})
+
+    def retrieve_learning_memory(self, user_id: str, topic: str = "", limit: int = 5) -> ToolResult:
+        if self.learning_context is None:
+            return ToolResult.ok({"memories": []})
+        return ToolResult.ok({"memories": self.learning_context.retrieve_learning_memory(user_id, topic or None, min(max(limit, 1), 10))})
+
+    def get_topic_mastery(self, user_id: str, topic: str) -> ToolResult:
+        if self.learning_context is None:
+            return ToolResult.ok({"mastery_score": None})
+        return ToolResult.ok({"mastery_score": self.learning_context.get_topic_mastery(user_id, topic)})
+
+    def get_previous_attempts(self, user_id: str, topic: str = "", limit: int = 5) -> ToolResult:
+        if self.learning_context is None:
+            return ToolResult.ok({"attempts": []})
+        return ToolResult.ok({"attempts": self.learning_context.get_previous_attempts(user_id, topic or None, min(max(limit, 1), 10))})
+
+    def get_course_material(self, topic: str, limit: int = 3) -> ToolResult:
+        if self.learning_context is None:
+            return ToolResult.ok({"materials": []})
+        return ToolResult.ok({"materials": self.learning_context.get_course_material(topic, min(max(limit, 1), 5))})
 
 
 class ToolRegistry:
@@ -323,6 +424,10 @@ class ToolRegistry:
         "select_learning_topic": {
             "required": ["user_id", "topic"],
         },
+        "retrieve_learning_memory": {"required": ["user_id"]},
+        "get_topic_mastery": {"required": ["user_id", "topic"]},
+        "get_previous_attempts": {"required": ["user_id"]},
+        "get_course_material": {"required": ["topic"]},
     }
 
     def __init__(self, tools: LearningTools):
@@ -372,6 +477,14 @@ class ToolRegistry:
                     user_id=str(arguments["user_id"]),
                     topic=str(arguments["topic"]),
                 )
+            if name == "retrieve_learning_memory":
+                return self.tools.retrieve_learning_memory(str(arguments["user_id"]), str(arguments.get("topic", "")), int(arguments.get("limit", 5)))
+            if name == "get_topic_mastery":
+                return self.tools.get_topic_mastery(str(arguments["user_id"]), str(arguments["topic"]))
+            if name == "get_previous_attempts":
+                return self.tools.get_previous_attempts(str(arguments["user_id"]), str(arguments.get("topic", "")), int(arguments.get("limit", 5)))
+            if name == "get_course_material":
+                return self.tools.get_course_material(str(arguments["topic"]), int(arguments.get("limit", 3)))
             return self.tools.reset_learning_progress(
                 user_id=str(arguments["user_id"]),
                 explicit_confirmation=arguments["explicit_confirmation"] is True,

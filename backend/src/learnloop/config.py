@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -38,6 +38,9 @@ class Settings:
     max_extra_topic_iterations: int
     question_bank_path: Path
     progress_dir: Path
+    memory_db_path: Optional[Path] = None
+    memory_jsonl_path: Optional[Path] = None
+    coach_rules_path: Optional[Path] = None
 
     @property
     def has_real_api_key(self) -> bool:
@@ -58,5 +61,7 @@ class Settings:
             ),
             question_bank_path=root / "data" / "questions" / "ddia_questions.json",
             progress_dir=root / "data" / "progress",
+            memory_db_path=root / "data" / "learnloop.sqlite3",
+            memory_jsonl_path=root / "data" / "learning_memories.jsonl",
+            coach_rules_path=root / "coach_rules.md",
         )
-

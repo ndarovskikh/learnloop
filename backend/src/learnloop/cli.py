@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import tempfile
+from pathlib import Path
 from typing import Dict
 
 from .app import build_agent
 from .config import Settings
 from .models import CheckpointDecision
+from .memory_store import LearningMemoryStore
 
 
 DECISIONS: Dict[str, CheckpointDecision] = {
@@ -71,10 +74,32 @@ def run(user_id: str) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser(description="LearnLoop adaptive coach")
     parser.add_argument("--user", default="demo-student")
+    parser.add_argument("--memory-demo", action="store_true", help="run the SQLite/JSON memory example")
+    parser.add_argument("--memory-status", action="store_true", help="show saved memory statistics for the user")
     args = parser.parse_args()
+    if args.memory_demo:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = LearningMemoryStore(root / "learnloop.sqlite3", root / "memories.jsonl")
+            store.seed_question(course_id="ddia", course_title="DDIA", topic_id="latency", topic_title="Latency", question_id="ddia-latency-01", difficulty="easy", question_text="Explain P95 latency.", expected_answer="95th percentile")
+            attempt_id = store.record_attempt(user_id="user-1", user_name="Natalia", question_id="ddia-latency-01", score=0.4)
+            store.remember(user_id="user-1", type="learning_fact", content="Student confuses P95 and P99.", cue=["latency", "percentiles"], source={"question_id": "ddia-latency-01", "attempt_id": attempt_id})
+            print("mastery(latency)=%.2f" % store.mastery_for("user-1", "latency"))
+            print("memories=%d" % len(store.memories_for("user-1")))
+        return
+    if args.memory_status:
+        settings = Settings.load()
+        if not settings.memory_db_path or not settings.memory_jsonl_path:
+            parser.error("persistent memory paths are not configured")
+        store = LearningMemoryStore(
+            settings.memory_db_path, settings.memory_jsonl_path
+        )
+        print("database=%s" % settings.memory_db_path)
+        print("attempts=%d" % store.attempt_count_for(args.user))
+        print("observations=%d" % len(store.memories_for(args.user)))
+        return
     raise SystemExit(run(args.user))
 
 
 if __name__ == "__main__":
     main()
-

@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from learnloop.models import CheckpointDecision, Difficulty, TopicStatus
+from learnloop.memory_store import LearningMemoryStore
 
 from helpers import build_components, question
 
@@ -37,6 +38,22 @@ class LearningToolsTests(unittest.TestCase):
             self.assertEqual(progress.topic_depth, 1)
             self.assertIn("q-1", progress.answered_question_ids)
             self.assertEqual(len(progress.attempts), 1)
+
+    def test_assessment_is_also_written_to_structured_memory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, _, tools, _, _ = build_components(root)
+            store = LearningMemoryStore(root / "learnloop.sqlite3", root / "memories.jsonl")
+            tools.memory_store = store
+
+            result = tools.assess_and_record_answer(
+                "student-1", "q-1", "unrelated answer"
+            )
+
+            self.assertTrue(result.success)
+            self.assertEqual(store.attempt_count_for("student-1"), 1)
+            self.assertEqual(store.mastery_for("student-1", "latency"), 0.0)
+            self.assertEqual(len(store.memories_for("student-1")), 1)
 
     def test_unknown_question_reaches_error_branch(self):
         with tempfile.TemporaryDirectory() as directory:
