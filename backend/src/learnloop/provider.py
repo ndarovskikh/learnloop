@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, Dict, List, Protocol
+from typing import Any, Dict, List, Protocol, Optional
 
 from .models import Assessment, Difficulty, Question
 
 
 class LearningProvider(Protocol):
-    def assess(self, question: Question, student_answer: str) -> Assessment:
+    def assess(self, question: Question, student_answer: str, context: str = "") -> Assessment:
         ...
 
     def generate_question(
@@ -16,7 +16,7 @@ class LearningProvider(Protocol):
         topic: str,
         difficulty: Difficulty,
         knowledge_gaps: List[str],
-        source_context: str,
+        source_context: str, context: str = "",
     ) -> Question:
         ...
 
@@ -32,7 +32,7 @@ def _difficulty_for_score(score: float) -> Difficulty:
 class HeuristicProvider:
     """Deterministic local provider for tests and keyless demos."""
 
-    def assess(self, question: Question, student_answer: str) -> Assessment:
+    def assess(self, question: Question, student_answer: str, context: str = "") -> Assessment:
         normalized = student_answer.lower()
         matched = [
             concept
@@ -66,7 +66,7 @@ class HeuristicProvider:
         topic: str,
         difficulty: Difficulty,
         knowledge_gaps: List[str],
-        source_context: str,
+        source_context: str, context: str = "",
     ) -> Question:
         gap = knowledge_gaps[0] if knowledge_gaps else topic
         digest = hashlib.sha256(
@@ -118,13 +118,13 @@ class OpenAIProvider:
             raise ValueError("PROVIDER_INVALID_JSON")
         return parsed
 
-    def assess(self, question: Question, student_answer: str) -> Assessment:
+    def assess(self, question: Question, student_answer: str, context: str = "") -> Assessment:
         payload = self._json_call(
             system=(
                 "You are a strict learning evaluator. Use only the supplied "
                 "rubric. Return JSON with question_id, score (0..1), feedback, "
                 "knowledge_gaps (array), and recommended_difficulty "
-                "(easy|medium|hard)."
+                "(easy|medium|hard).\n\n" + context
             ),
             user=json.dumps(
                 {
@@ -151,14 +151,14 @@ class OpenAIProvider:
         topic: str,
         difficulty: Difficulty,
         knowledge_gaps: List[str],
-        source_context: str,
+        source_context: str, context: str = "",
     ) -> Question:
         payload = self._json_call(
             system=(
                 "Generate exactly one question using only the supplied source "
                 "context. Return JSON with id, topic, difficulty, text, "
                 "expected_concepts, explanation, and source. Never invent a "
-                "source. The ID must start with generated-."
+                "source. The ID must start with generated-.\n\n" + context
             ),
             user=json.dumps(
                 {

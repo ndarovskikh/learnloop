@@ -71,6 +71,37 @@ learnloop/
 └── frontend/  Vue 3 course library, chat workspace and learning analytics
 ```
 
+### Minimal memory demo
+
+The three memory types can be exercised without an API key:
+
+```bash
+PYTHONPATH=backend/src python -m learnloop --memory-demo
+```
+
+It writes a scored attempt and calculated topic mastery to SQLite, then writes
+one coach observation to JSONL. In the running application the same storage is
+created automatically at `backend/data/learnloop.sqlite3` and
+`backend/data/learning_memories.jsonl`; no database server is required. Check
+the persistent records with:
+
+```bash
+PYTHONPATH=backend/src python3 -m learnloop --memory-status --user natali
+sqlite3 backend/data/learnloop.sqlite3 '.tables'
+```
+
+The permanent trainer rules are in
+[`backend/coach_rules.md`](backend/coach_rules.md).
+
+### LLM context
+
+Every model call receives a small push-context: coach rules, privacy rules,
+student and course identifiers, active topic/question, topic mastery, and the
+last three exchanges. Detailed data stays pull-only. The registered pull tools
+are `retrieve_learning_memory`, `get_topic_mastery`, `get_previous_attempts`,
+and `get_course_material`; each student-memory request is scoped to its own
+`user_id`.
+
 ## 3. Install all backend dependencies
 
 Create an isolated Python environment:
