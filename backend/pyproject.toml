@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "learnloop"
+version = "0.1.0"
+description = "Adaptive agent loop for course learning"
+requires-python = ">=3.9"
+dependencies = [
+  "fastapi>=0.115.0",
+  "openai>=1.30.0",
+  "uvicorn>=0.30.0",
+]
+
+[project.scripts]
+learnloop = "learnloop.cli:main"
+learnloop-api = "learnloop.api:run"
+
+[tool.setuptools.packages.find]
+where = ["src"]

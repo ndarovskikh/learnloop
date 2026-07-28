@@ -1,0 +1,15 @@
+.DS_Store
+.env
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Runtime state and local/copyrighted materials
+backend/data/progress/*.json
+backend/data/materials/*.pdf
+
+# Frontend build artifacts
+frontend/node_modules/
+frontend/dist/

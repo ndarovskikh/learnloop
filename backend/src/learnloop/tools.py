@@ -1,0 +1,380 @@
+from __future__ import annotations
+
+from dataclasses import asdict
+from typing import Any, Dict, List
+
+from .models import (
+    Assessment,
+    Attempt,
+    CheckpointDecision,
+    Difficulty,
+    StudentProgress,
+    ToolResult,
+    TopicStatus,
+)
+from .provider import LearningProvider
+from .question_bank import QuestionBank
+from .repository import ProgressRepository
+
+
+def _unique(values: List[str]) -> List[str]:
+    return list(dict.fromkeys(value for value in values if value))
+
+
+class LearningTools:
+    def __init__(
+        self,
+        repository: ProgressRepository,
+        question_bank: QuestionBank,
+        provider: LearningProvider,
+        max_topic_depth: int = 5,
+        max_extra_iterations: int = 1,
+    ):
+        self.repository = repository
+        self.question_bank = question_bank
+        self.provider = provider
+        self.max_topic_depth = max_topic_depth
+        self.max_extra_iterations = max_extra_iterations
+
+    def assess_and_record_answer(
+        self,
+        user_id: str,
+        question_id: str,
+        student_answer: str,
+    ) -> ToolResult:
+        if not student_answer.strip():
+            return ToolResult.error("EMPTY_ANSWER", "Student answer must not be empty")
+        try:
+            question = self.question_bank.get(question_id)
+            progress = self.repository.load(user_id)
+        except KeyError:
+            return ToolResult.error(
+                "QUESTION_NOT_FOUND",
+                "Question %s does not exist" % question_id,
+            )
+        except ValueError as exc:
+            return ToolResult.error("STATE_READ_FAILED", str(exc))
+
+        if question_id in progress.answered_question_ids:
+            return ToolResult.error(
+                "QUESTION_ALREADY_ANSWERED",
+                "Question %s was already recorded" % question_id,
+            )
+        if progress.topic_status == TopicStatus.MASTERY_CONFIRMATION_REQUIRED:
+            return ToolResult.error(
+                "CHECKPOINT_PENDING",
+                "Resolve the topic checkpoint before another answer",
+            )
+        try:
+            assessment = self.provider.assess(question, student_answer)
+        except Exception as exc:
+            return ToolResult.error("ASSESSMENT_FAILED", str(exc))
+
+        if assessment.question_id != question.id:
+            return ToolResult.error(
+                "ASSESSMENT_QUESTION_MISMATCH",
+                "Evaluator returned an assessment for another question",
+            )
+
+        progress.active_topic = question.topic
+        progress.topic_depth += 1
+        progress.knowledge_gaps = _unique(
+            progress.knowledge_gaps + assessment.knowledge_gaps
+        )
+        progress.answered_question_ids.append(question.id)
+        progress.attempts.append(
+            Attempt(
+                question_id=question.id,
+                topic=question.topic,
+                score=assessment.score,
+                feedback=assessment.feedback,
+                knowledge_gaps=assessment.knowledge_gaps,
+                question_text=question.text,
+                student_answer=student_answer,
+            )
+        )
+        progress.recalculate_mastery()
+        new_mastery = progress.mastery[question.topic]
+
+        checkpoint_required = progress.topic_depth >= self.max_topic_depth
+        if checkpoint_required:
+            progress.topic_status = TopicStatus.MASTERY_CONFIRMATION_REQUIRED
+
+        try:
+            self.repository.save(progress)
+            verified = self.repository.load(user_id)
+        except (OSError, ValueError) as exc:
+            return ToolResult.error("PROGRESS_WRITE_FAILED", str(exc))
+
+        if (
+            verified.topic_depth != progress.topic_depth
+            or question.id not in verified.answered_question_ids
+        ):
+            return ToolResult.error(
+                "PROGRESS_VERIFICATION_FAILED",
+                "Saved progress does not contain the expected attempt",
+            )
+
+        return ToolResult.ok(
+            {
+                "assessment": assessment.to_dict(),
+                "saved_state": {
+                    "topic": question.topic,
+                    "topic_depth": verified.topic_depth,
+                    "mastery": verified.mastery[question.topic],
+                    "topic_status": verified.topic_status.value,
+                },
+                "checkpoint_required": checkpoint_required,
+            }
+        )
+
+    def generate_next_question(
+        self,
+        user_id: str,
+        topic: str,
+        difficulty: Difficulty,
+        knowledge_gaps: List[str],
+    ) -> ToolResult:
+        try:
+            progress = self.repository.load(user_id)
+        except ValueError as exc:
+            return ToolResult.error("STATE_READ_FAILED", str(exc))
+
+        if progress.topic_status == TopicStatus.MASTERY_CONFIRMATION_REQUIRED:
+            return ToolResult.error(
+                "CHECKPOINT_PENDING",
+                "Student validation is required before another question",
+            )
+        if progress.topic_status in (TopicStatus.MASTERED, TopicStatus.NEEDS_REVIEW):
+            return ToolResult.error(
+                "TOPIC_SESSION_FINISHED",
+                "The current topic session has already finished",
+            )
+
+        try:
+            question = self.question_bank.find_unused(
+                topic=topic,
+                difficulty=difficulty,
+                excluded_ids=progress.answered_question_ids,
+            )
+            generated = False
+            if question is None:
+                related = [
+                    item
+                    for item in self.question_bank.all()
+                    if item.topic == topic
+                ]
+                source_context = "; ".join(
+                    "%s — %s" % (item.source, item.explanation)
+                    for item in related[:3]
+                )
+                if not source_context:
+                    return ToolResult.error(
+                        "NO_GROUNDED_SOURCE",
+                        "No approved course source exists for topic %s" % topic,
+                    )
+                question = self.provider.generate_question(
+                    topic=topic,
+                    difficulty=difficulty,
+                    knowledge_gaps=knowledge_gaps,
+                    source_context=source_context,
+                )
+                if not question.expected_concepts or not question.source.strip():
+                    return ToolResult.error(
+                        "UNGROUNDED_QUESTION",
+                        "Generated question has no rubric or source",
+                    )
+                self.question_bank.add(question)
+                generated = True
+        except (KeyError, OSError, ValueError) as exc:
+            return ToolResult.error("QUESTION_GENERATION_FAILED", str(exc))
+        except Exception as exc:
+            return ToolResult.error("PROVIDER_QUESTION_FAILED", str(exc))
+
+        return ToolResult.ok(
+            {
+                "question": question.to_dict(),
+                "generated": generated,
+            }
+        )
+
+    def resolve_topic_checkpoint(
+        self,
+        user_id: str,
+        decision: CheckpointDecision,
+    ) -> ToolResult:
+        try:
+            progress = self.repository.load(user_id)
+        except ValueError as exc:
+            return ToolResult.error("STATE_READ_FAILED", str(exc))
+        if progress.topic_status != TopicStatus.MASTERY_CONFIRMATION_REQUIRED:
+            return ToolResult.error(
+                "NO_CHECKPOINT_PENDING",
+                "There is no mastery checkpoint awaiting a decision",
+            )
+
+        if decision == CheckpointDecision.MARK_MASTERED:
+            progress.topic_status = TopicStatus.MASTERED
+        elif decision == CheckpointDecision.NEEDS_REVIEW:
+            progress.topic_status = TopicStatus.NEEDS_REVIEW
+        elif decision == CheckpointDecision.ONE_MORE_QUESTION:
+            if self.max_extra_iterations < 1 or progress.extra_iteration_used:
+                return ToolResult.error(
+                    "EXTRA_ITERATION_ALREADY_USED",
+                    "Only one extra topic question is allowed",
+                )
+            progress.extra_iteration_used = True
+            progress.topic_status = TopicStatus.IN_PROGRESS
+        else:
+            return ToolResult.error("INVALID_DECISION", str(decision))
+
+        try:
+            self.repository.save(progress)
+            verified = self.repository.load(user_id)
+        except (OSError, ValueError) as exc:
+            return ToolResult.error("PROGRESS_WRITE_FAILED", str(exc))
+
+        return ToolResult.ok(
+            {
+                "decision": decision.value,
+                "progress": verified.to_dict(),
+            }
+        )
+
+    def reset_learning_progress(
+        self,
+        user_id: str,
+        explicit_confirmation: bool,
+    ) -> ToolResult:
+        if explicit_confirmation is not True:
+            return ToolResult.error(
+                "APPROVAL_REQUIRED",
+                "Reset requires a separate explicit user confirmation",
+            )
+        try:
+            progress = self.repository.reset(user_id)
+        except (OSError, ValueError) as exc:
+            return ToolResult.error("RESET_FAILED", str(exc))
+        return ToolResult.ok({"progress": progress.to_dict()})
+
+    def reset_topic_progress(
+        self,
+        user_id: str,
+        topic: str,
+        explicit_confirmation: bool,
+    ) -> ToolResult:
+        if explicit_confirmation is not True:
+            return ToolResult.error(
+                "APPROVAL_REQUIRED",
+                "Topic reset requires a separate explicit user confirmation",
+            )
+        try:
+            progress = self.repository.load(user_id)
+            if topic != progress.active_topic:
+                return ToolResult.error(
+                    "TOPIC_MISMATCH",
+                    "Only the current topic can be reset",
+                )
+            progress = self.repository.reset_topic(user_id, topic)
+        except (OSError, ValueError) as exc:
+            return ToolResult.error("RESET_FAILED", str(exc))
+        return ToolResult.ok({"progress": progress.to_dict()})
+
+    def select_learning_topic(
+        self,
+        user_id: str,
+        topic: str,
+    ) -> ToolResult:
+        valid_topics = {question.topic for question in self.question_bank.all()}
+        if topic not in valid_topics:
+            return ToolResult.error(
+                "TOPIC_NOT_FOUND",
+                "Topic %s does not exist in the question bank" % topic,
+            )
+        try:
+            progress = self.repository.load(user_id)
+            progress.activate_topic(topic)
+            self.repository.save(progress)
+            verified = self.repository.load(user_id)
+        except (OSError, ValueError) as exc:
+            return ToolResult.error("TOPIC_SELECTION_FAILED", str(exc))
+        return ToolResult.ok({"progress": verified.to_dict()})
+
+
+class ToolRegistry:
+    """Small allowlist that exposes only named, validated learning tools."""
+
+    SCHEMAS: Dict[str, Dict[str, Any]] = {
+        "assess_and_record_answer": {
+            "required": ["user_id", "question_id", "student_answer"],
+        },
+        "generate_next_question": {
+            "required": ["user_id", "topic", "difficulty", "knowledge_gaps"],
+        },
+        "resolve_topic_checkpoint": {
+            "required": ["user_id", "decision"],
+        },
+        "reset_learning_progress": {
+            "required": ["user_id", "explicit_confirmation"],
+        },
+        "reset_topic_progress": {
+            "required": ["user_id", "topic", "explicit_confirmation"],
+        },
+        "select_learning_topic": {
+            "required": ["user_id", "topic"],
+        },
+    }
+
+    def __init__(self, tools: LearningTools):
+        self.tools = tools
+
+    def execute(self, name: str, arguments: Dict[str, Any]) -> ToolResult:
+        schema = self.SCHEMAS.get(name)
+        if schema is None:
+            return ToolResult.error("UNKNOWN_TOOL", "Tool %s is not allowed" % name)
+        missing = [
+            key for key in schema["required"] if key not in arguments
+        ]
+        if missing:
+            return ToolResult.error(
+                "INVALID_TOOL_ARGUMENTS",
+                "Missing required arguments: %s" % ", ".join(missing),
+            )
+        try:
+            if name == "assess_and_record_answer":
+                return self.tools.assess_and_record_answer(
+                    user_id=str(arguments["user_id"]),
+                    question_id=str(arguments["question_id"]),
+                    student_answer=str(arguments["student_answer"]),
+                )
+            if name == "generate_next_question":
+                return self.tools.generate_next_question(
+                    user_id=str(arguments["user_id"]),
+                    topic=str(arguments["topic"]),
+                    difficulty=Difficulty(str(arguments["difficulty"])),
+                    knowledge_gaps=[
+                        str(item) for item in arguments["knowledge_gaps"]
+                    ],
+                )
+            if name == "resolve_topic_checkpoint":
+                return self.tools.resolve_topic_checkpoint(
+                    user_id=str(arguments["user_id"]),
+                    decision=CheckpointDecision(str(arguments["decision"])),
+                )
+            if name == "reset_topic_progress":
+                return self.tools.reset_topic_progress(
+                    user_id=str(arguments["user_id"]),
+                    topic=str(arguments["topic"]),
+                    explicit_confirmation=arguments["explicit_confirmation"] is True,
+                )
+            if name == "select_learning_topic":
+                return self.tools.select_learning_topic(
+                    user_id=str(arguments["user_id"]),
+                    topic=str(arguments["topic"]),
+                )
+            return self.tools.reset_learning_progress(
+                user_id=str(arguments["user_id"]),
+                explicit_confirmation=arguments["explicit_confirmation"] is True,
+            )
+        except (TypeError, ValueError) as exc:
+            return ToolResult.error("INVALID_TOOL_ARGUMENTS", str(exc))
