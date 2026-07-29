@@ -4,8 +4,10 @@ import {
   getCourse,
   getCourses,
   generatePracticeQuestions,
+  listTeacherMaterials,
   login,
   materialUrl,
+  publishMaterial,
   resetAllProgress,
   resetTopicProgress,
   resolveCheckpoint,
@@ -16,18 +18,61 @@ import {
 const userId = ref("");
 const username = ref("");
 const password = ref("");
+const role = ref("student");
 const authError = ref("");
 const authenticating = ref(false);
 const courses = ref([]);
+const teacherMaterials = ref([]);
+const teacherLoading = ref(true);
+const teacherPublishing = ref(false);
+const teacherError = ref("");
+const teacherResult = ref(null);
+const materialForm = ref({
+  topicId: "",
+  topicTitle: "",
+  title: "",
+  content: "",
+  questionCount: 5,
+});
 const workspace = ref(null);
 const selectedCourseId = ref(null);
 const loading = ref(true);
 const sending = ref(false);
+const finalizing = ref(false);
 const error = ref("");
 const draft = ref("");
 const chatFeed = ref(null);
 const visibleHistory = ref([]);
 let animationGeneration = 0;
+
+// Multi-message answers: each "add" queues one chunk (graded later, all at
+// once); draftChunks/draftSeq/idleFinalizeTimer track that queue client-side.
+// See backend/src/learnloop/answer_queue.py for how the server serializes
+// and combines them safely.
+const draftChunks = ref([]);
+const draftSeq = ref(0);
+const IDLE_FINALIZE_MS = 7000;
+let idleFinalizeTimer = null;
+
+function clearIdleFinalizeTimer() {
+  if (idleFinalizeTimer) {
+    window.clearTimeout(idleFinalizeTimer);
+    idleFinalizeTimer = null;
+  }
+}
+
+function scheduleIdleFinalize() {
+  clearIdleFinalizeTimer();
+  idleFinalizeTimer = window.setTimeout(() => {
+    finalizeAnswer();
+  }, IDLE_FINALIZE_MS);
+}
+
+function resetDraftState() {
+  clearIdleFinalizeTimer();
+  draftChunks.value = [];
+  draftSeq.value = 0;
+}
 
 const analytics = computed(() => workspace.value?.analytics || {});
 const displayName = computed(() =>
@@ -104,8 +149,13 @@ async function submitLogin() {
       password: password.value,
     });
     userId.value = account.user_id;
+    role.value = account.role || "student";
     password.value = "";
-    await loadCourses();
+    if (role.value === "teacher") {
+      await loadTeacherMaterials();
+    } else {
+      await loadCourses();
+    }
   } catch (requestError) {
     authError.value = requestError.message;
   } finally {
@@ -118,17 +168,72 @@ function logout() {
   userId.value = "";
   username.value = "";
   password.value = "";
+  role.value = "student";
   authError.value = "";
   courses.value = [];
   selectedCourseId.value = null;
   workspace.value = null;
   visibleHistory.value = [];
   error.value = "";
+  teacherMaterials.value = [];
+  teacherResult.value = null;
+  teacherError.value = "";
+}
+
+async function loadTeacherMaterials() {
+  teacherLoading.value = true;
+  teacherError.value = "";
+  try {
+    teacherMaterials.value = await listTeacherMaterials();
+  } catch (requestError) {
+    teacherError.value = requestError.message;
+  } finally {
+    teacherLoading.value = false;
+  }
+}
+
+async function submitMaterial() {
+  const form = materialForm.value;
+  if (
+    !form.topicId.trim() ||
+    !form.topicTitle.trim() ||
+    !form.title.trim() ||
+    !form.content.trim() ||
+    teacherPublishing.value
+  ) {
+    return;
+  }
+  teacherPublishing.value = true;
+  teacherError.value = "";
+  teacherResult.value = null;
+  try {
+    const result = await publishMaterial({
+      topic_id: form.topicId.trim(),
+      topic_title: form.topicTitle.trim(),
+      title: form.title.trim(),
+      content: form.content.trim(),
+      question_count: Number(form.questionCount) || 5,
+    });
+    teacherResult.value = result;
+    materialForm.value = {
+      topicId: "",
+      topicTitle: "",
+      title: "",
+      content: "",
+      questionCount: 5,
+    };
+    await loadTeacherMaterials();
+  } catch (requestError) {
+    teacherError.value = requestError.message;
+  } finally {
+    teacherPublishing.value = false;
+  }
 }
 
 async function openCourse(courseId) {
   loading.value = true;
   error.value = "";
+  resetDraftState();
   try {
     workspace.value = await getCourse(courseId, userId.value);
     visibleHistory.value = [...workspace.value.history];
@@ -143,6 +248,7 @@ async function openCourse(courseId) {
 
 function closeCourse() {
   animationGeneration += 1;
+  resetDraftState();
   selectedCourseId.value = null;
   workspace.value = null;
   visibleHistory.value = [];
@@ -150,21 +256,80 @@ function closeCourse() {
   loadCourses();
 }
 
-async function submitAnswer() {
+// Enter (or the ↑ button) queues the current text as one chunk of the
+// answer without grading it — the student can keep typing more chunks.
+// The request is awaited (not fire-and-forget) so chunks from one tab are
+// naturally sent in order; the server also orders by `seq` and dedupes by
+// `chunk_id` in case a request is retried or two ever race anyway.
+async function addChunk() {
   const message = draft.value.trim();
   const question = workspace.value?.current_question;
-  if (!message || !question || sending.value) return;
+  if (!message || !question || sending.value || finalizing.value) return;
 
   sending.value = true;
   error.value = "";
   draft.value = "";
-  const previousHistory = [...visibleHistory.value];
-  const optimisticId = `optimistic-user-${Date.now()}`;
+  const chunkId = crypto.randomUUID();
+  const seq = draftSeq.value++;
+  const bubbleId = `draft-${chunkId}`;
   visibleHistory.value.push({
-    id: optimisticId,
+    id: bubbleId,
     role: "user",
     content: message,
+    draft: true,
   });
+  scrollToLatest();
+
+  try {
+    await sendAnswer(selectedCourseId.value, {
+      user_id: userId.value,
+      question_id: question.id,
+      message,
+      chunk_id: chunkId,
+      seq,
+      finalize: false,
+    });
+    draftChunks.value.push({ id: chunkId, bubbleId });
+    scheduleIdleFinalize();
+  } catch (requestError) {
+    visibleHistory.value = visibleHistory.value.filter(
+      (item) => item.id !== bubbleId,
+    );
+    draft.value = message;
+    error.value = requestError.message;
+  } finally {
+    sending.value = false;
+  }
+}
+
+// Grades everything queued so far (plus whatever is still in the box).
+// Triggered by the "Done" button or by the idle timer above — both call
+// this same function, and the backend's begin_finalize() guarantees that
+// if both somehow fire together, only one of them actually grades.
+async function finalizeAnswer() {
+  clearIdleFinalizeTimer();
+  const question = workspace.value?.current_question;
+  const trailing = draft.value.trim();
+  if (!question || finalizing.value || (!trailing && draftChunks.value.length === 0)) {
+    return;
+  }
+
+  finalizing.value = true;
+  sending.value = true;
+  error.value = "";
+  draft.value = "";
+  const chunkId = crypto.randomUUID();
+  const seq = draftSeq.value++;
+  let trailingBubbleId = null;
+  if (trailing) {
+    trailingBubbleId = `draft-${chunkId}`;
+    visibleHistory.value.push({
+      id: trailingBubbleId,
+      role: "user",
+      content: trailing,
+      draft: true,
+    });
+  }
   visibleHistory.value.push({
     id: "coach-thinking",
     role: "assistant",
@@ -173,14 +338,31 @@ async function submitAnswer() {
   });
   scrollToLatest();
 
+  const draftBubbleIds = new Set(
+    [
+      ...draftChunks.value.map((chunk) => chunk.bubbleId),
+      trailingBubbleId,
+      "coach-thinking",
+    ].filter(Boolean),
+  );
+
   try {
     const response = await sendAnswer(selectedCourseId.value, {
       user_id: userId.value,
       question_id: question.id,
-      message,
+      message: trailing,
+      chunk_id: chunkId,
+      seq,
+      finalize: true,
     });
+
+    visibleHistory.value = visibleHistory.value.filter(
+      (item) => !draftBubbleIds.has(item.id),
+    );
+    resetDraftState();
+
     const userMessageIndex = response.history.findLastIndex(
-      (item) => item.role === "user" && item.content === message,
+      (item) => item.role === "user",
     );
     const generatedMessages =
       userMessageIndex >= 0
@@ -190,9 +372,10 @@ async function submitAnswer() {
         : [];
 
     workspace.value = response;
-    visibleHistory.value = visibleHistory.value.filter(
-      (item) => item.id !== "coach-thinking",
-    );
+    visibleHistory.value =
+      userMessageIndex >= 0
+        ? [...response.history.slice(0, userMessageIndex + 1)]
+        : [...visibleHistory.value];
 
     const generation = ++animationGeneration;
     for (const generatedMessage of generatedMessages) {
@@ -204,18 +387,22 @@ async function submitAnswer() {
       scrollToLatest();
     }
   } catch (requestError) {
-    visibleHistory.value = previousHistory;
-    draft.value = message;
+    visibleHistory.value = visibleHistory.value.filter(
+      (item) => item.id !== "coach-thinking",
+    );
+    if (trailing) draft.value = trailing;
     error.value = requestError.message;
   } finally {
     sending.value = false;
+    finalizing.value = false;
   }
 }
 
 async function chooseCheckpoint(decision) {
-  if (sending.value) return;
+  if (sending.value || finalizing.value) return;
   sending.value = true;
   error.value = "";
+  resetDraftState();
   try {
     workspace.value = await resolveCheckpoint(selectedCourseId.value, {
       user_id: userId.value,
@@ -231,9 +418,10 @@ async function chooseCheckpoint(decision) {
 }
 
 async function requestMorePractice() {
-  if (sending.value) return;
+  if (sending.value || finalizing.value) return;
   sending.value = true;
   error.value = "";
+  resetDraftState();
   try {
     workspace.value = await generatePracticeQuestions(
       selectedCourseId.value,
@@ -249,7 +437,7 @@ async function requestMorePractice() {
 }
 
 async function resetProgress(scope) {
-  if (sending.value) return;
+  if (sending.value || finalizing.value) return;
   const isCourseReset = scope === "course";
   const confirmed = window.confirm(
     isCourseReset
@@ -261,6 +449,7 @@ async function resetProgress(scope) {
   sending.value = true;
   error.value = "";
   animationGeneration += 1;
+  resetDraftState();
   try {
     workspace.value = isCourseReset
       ? await resetAllProgress(selectedCourseId.value, {
@@ -283,10 +472,11 @@ async function resetProgress(scope) {
 }
 
 async function selectTopic(topic) {
-  if (sending.value || topic.current) return;
+  if (sending.value || finalizing.value || topic.current) return;
   sending.value = true;
   error.value = "";
   animationGeneration += 1;
+  resetDraftState();
   try {
     workspace.value = await selectLearningTopic(selectedCourseId.value, {
       user_id: userId.value,
@@ -354,6 +544,119 @@ function openMaterial(material) {
           {{ authenticating ? "Signing in…" : "Sign in" }}
         </button>
       </form>
+    </section>
+  </main>
+
+  <main v-else-if="role === 'teacher'" class="library-page">
+    <header class="library-header">
+      <a class="brand" href="#" aria-label="LearnLoop home">
+        <span class="brand-mark">L</span>
+        <span>LearnLoop</span>
+      </a>
+      <div class="header-actions">
+        <div class="profile-chip">
+          <span class="status-dot"></span>
+          <span>{{ displayName }} · Teacher</span>
+          <span class="avatar">{{ userInitials }}</span>
+        </div>
+        <button class="logout-button" type="button" @click="logout">
+          Log out
+        </button>
+      </div>
+    </header>
+
+    <section class="hero">
+      <p class="eyebrow">COURSE MATERIAL AGENT</p>
+      <h1>Publish a new<br /><span>course longread.</span></h1>
+      <p class="hero-copy">
+        Uploading material here wakes the material agent: it grounds new
+        practice questions in your text and refreshes every student's
+        progress so the new topic shows up right away.
+      </p>
+    </section>
+
+    <section class="courses-section">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">NEW MATERIAL</p>
+          <h2>Add a topic</h2>
+        </div>
+      </div>
+
+      <form class="teacher-form" @submit.prevent="submitMaterial">
+        <div class="teacher-form-grid">
+          <label>
+            <span>Topic ID</span>
+            <input
+              v-model="materialForm.topicId"
+              placeholder="e.g. replication"
+            />
+          </label>
+          <label>
+            <span>Topic title</span>
+            <input
+              v-model="materialForm.topicTitle"
+              placeholder="e.g. Replication"
+            />
+          </label>
+          <label>
+            <span>Material title</span>
+            <input
+              v-model="materialForm.title"
+              placeholder="e.g. Chapter 5: Replication"
+            />
+          </label>
+          <label>
+            <span>Questions to generate</span>
+            <input
+              v-model.number="materialForm.questionCount"
+              type="number"
+              min="1"
+              max="10"
+            />
+          </label>
+        </div>
+        <label>
+          <span>Longread content</span>
+          <textarea
+            v-model="materialForm.content"
+            rows="8"
+            placeholder="Paste the course longread text here…"
+          ></textarea>
+        </label>
+        <button type="submit" :disabled="teacherPublishing">
+          {{ teacherPublishing ? "Publishing…" : "Publish material" }}
+        </button>
+      </form>
+
+      <p v-if="teacherError" class="error-banner">{{ teacherError }}</p>
+      <div v-if="teacherResult" class="teacher-result">
+        Generated {{ teacherResult.generated_questions.length }} question(s)
+        for “{{ teacherResult.topic_id }}” and refreshed
+        {{ teacherResult.recalculated_students }} student(s)' progress.
+      </div>
+
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">PUBLISHED SO FAR</p>
+          <h2>Materials</h2>
+        </div>
+        <span class="course-count">{{ teacherMaterials.length }} material</span>
+      </div>
+
+      <div v-if="teacherLoading" class="course-grid" aria-label="Loading materials">
+        <div class="course-card skeleton"></div>
+      </div>
+      <ul v-else-if="teacherMaterials.length" class="teacher-materials-list">
+        <li v-for="item in teacherMaterials" :key="item.id">
+          <strong>{{ item.title }}</strong>
+          <span>{{ item.topic_title }}</span>
+        </li>
+      </ul>
+      <div v-else class="material-note">
+        <span>i</span>
+        <p>No teacher-published material yet.</p>
+      </div>
     </section>
   </main>
 
@@ -467,7 +770,7 @@ function openMaterial(material) {
           type="button"
           @click="openMaterial(material)"
         >
-          <span class="pdf-icon">PDF</span>
+          <span class="pdf-icon">{{ material.type === "PDF" ? "PDF" : "TXT" }}</span>
           <span class="material-copy">
             <strong>{{ material.title }}</strong>
             <small>{{ material.status }}</small>
@@ -493,12 +796,13 @@ function openMaterial(material) {
           <article
             v-for="message in visibleHistory"
             :key="message.id"
-            :class="['message-row', message.role]"
+            :class="['message-row', message.role, { 'is-draft': message.draft }]"
           >
             <span v-if="message.role === 'assistant'" class="coach-avatar">L</span>
             <div class="message">
               <span class="message-author">
                 {{ message.role === "assistant" ? "LearnLoop" : "You" }}
+                <span v-if="message.draft" class="draft-badge">queued</span>
               </span>
               <p v-if="message.thinking" class="thinking-dots" aria-label="LearnLoop is thinking">
                 <span></span><span></span><span></span>
@@ -563,27 +867,46 @@ function openMaterial(material) {
           </div>
         </div>
 
-        <form class="composer" @submit.prevent="submitAnswer">
+        <p v-if="draftChunks.length" class="queue-hint">
+          {{ draftChunks.length }} message{{ draftChunks.length > 1 ? "s" : "" }} queued —
+          checks automatically in a few seconds, or press Done now.
+        </p>
+        <form class="composer" @submit.prevent="addChunk">
           <textarea
             v-model="draft"
-            :disabled="!workspace.current_question || sending"
+            :disabled="!workspace.current_question || finalizing"
             :placeholder="
               workspace.current_question
-                ? 'Write your answer…'
+                ? 'Write your answer… press Enter to add, Done to check it'
                 : 'Complete the checkpoint to continue'
             "
             rows="2"
-            @keydown.enter.exact.prevent="submitAnswer"
+            @keydown.enter.exact.prevent="addChunk"
           ></textarea>
-          <button
-            type="submit"
-            :disabled="
-              !draft.trim() || !workspace.current_question || sending
-            "
-            aria-label="Send answer"
-          >
-            {{ sending ? "…" : "↑" }}
-          </button>
+          <div class="composer-actions">
+            <button
+              type="submit"
+              :disabled="
+                !draft.trim() || !workspace.current_question || sending || finalizing
+              "
+              aria-label="Add message to answer"
+              title="Add to answer (Enter)"
+            >
+              {{ sending && !finalizing ? "…" : "↑" }}
+            </button>
+            <button
+              type="button"
+              class="done-button"
+              :disabled="
+                (!draft.trim() && draftChunks.length === 0) ||
+                !workspace.current_question ||
+                finalizing
+              "
+              @click="finalizeAnswer"
+            >
+              {{ finalizing ? "Checking…" : "Done ✓" }}
+            </button>
+          </div>
         </form>
         <p v-if="error" class="inline-error">{{ error }}</p>
       </section>

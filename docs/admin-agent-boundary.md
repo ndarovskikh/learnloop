@@ -20,3 +20,10 @@ The ordinary chat agent may route only a request for the current user's own
 percentile or top percentage to this helper. It passes the current chat user
 ID itself; no chat input can select another target user. Requests that
 ask about another student are rejected.
+
+In the five-agent architecture (see the README's "Multi-agent architecture"
+section) this is agent 4, "Danya". It has a reserved
+`LEARNLOOP_SUPERIOR_API_KEY`/`_MODEL`/`_BASE_URL` configuration for symmetry
+with the other four agents, but the key is never used to call an LLM: the
+percentile is always deterministic SQL, which is the property this document
+depends on.

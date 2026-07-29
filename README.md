@@ -102,6 +102,26 @@ are `retrieve_learning_memory`, `get_topic_mastery`, `get_previous_attempts`,
 and `get_course_material`; each student-memory request is scoped to its own
 `user_id`.
 
+### Multi-agent architecture
+
+LearnLoop is five small agents, each with its own configurable API
+key/model/base URL (`backend/.env.example` has the full list; any of them
+left unset fall back to the main `OPENAI_*` key so a single key still works
+end to end):
+
+| # | Agent | Env var prefix | Role | Triggered by |
+| - | ----- | --------------- | ---- | ------------- |
+| 1 | Main coach agent (`AgentLoop`) | `OPENAI_*` | Picks and asks the next question, records the answer. | Every student turn. |
+| 2 | Andrew — answer validation agent (`AnswerValidationAgent`) | `LEARNLOOP_VALIDATOR_*` | Scores the student's answer (0–1) with feedback and knowledge gaps. Called by agent 1 as a tool, never the other way around. | Every submitted answer. |
+| 3 | Liza — adaptive question-bank agent (`AdaptiveQuestionBankAgent`) | `LEARNLOOP_QUESTION_BANK_*` | Reads SQLite progress and mastery, writes a private batch of 5 grounded questions for the student's weakest topic. | Nightly cron, or a student hitting the topic depth limit (5) and asking to regenerate — see "Personal question-bank agent" below. |
+| 4 | Danya — superior/statistics agent (`AdminStatisticsAgent`) | `LEARNLOOP_SUPERIOR_*` (reserved, see note) | Answers "how do I compare to others" with only the requester's own percentile/top-percent. | A student asking their ranking in chat, or `POST /api/admin/benchmark`. |
+| 5 | Natali — course material agent (`CourseMaterialAgent`) | `LEARNLOOP_MATERIAL_*` | Stores a teacher-uploaded longread, grounds new questions in it, and refreshes every known student's saved progress. | A teacher publishing material via `POST /api/teacher/materials`. |
+
+Agent 4's percentile is computed with deterministic SQL rather than an LLM on
+purpose, so a crafted prompt cannot widen what it discloses (see
+[`docs/admin-agent-boundary.md`](docs/admin-agent-boundary.md)); its reserved
+key is accepted but not called for that reason.
+
 ### Admin statistics agent
 
 The privileged `AdminStatisticsAgent` can calculate only an authenticated
@@ -135,6 +155,26 @@ When nobody has progress, or a student's course completion is below 5%, the
 nightly command intentionally writes nothing to stdout and exits successfully.
 The decision is still recorded in SQLite table `question_generation_logs` with
 status `silent`, the reason, completion value, trigger, and timestamp.
+
+### Course material agent
+
+Signing in with the demo `teacher` account (see [Demo accounts](#demo-accounts))
+opens a **Publish a new course longread** panel instead of the student
+workspace. Submitting a topic ID, topic title, material title, and the
+longread text calls `POST /api/teacher/materials`, which wakes the course
+material agent (agent 5, "Natali"):
+
+1. the text is stored under `backend/data/materials/` and listed alongside
+   the course PDF in every student's materials sidebar;
+2. a small batch of questions (5 by default) is grounded in that text and
+   added to the shared question bank for the new topic;
+3. every known student's saved progress is reloaded and resaved, so the new
+   topic and questions appear immediately instead of on their next answer.
+
+The decision is recorded in SQLite table `material_ingestion_logs`. Set
+`LEARNLOOP_TEACHER_TOKEN` in `backend/.env` to also require an
+`X-Teacher-Token` header on the endpoint; it is optional and unset by
+default for the demo.
 
 ## 3. Install all backend dependencies
 
@@ -213,6 +253,13 @@ MAX_EXTRA_TOPIC_ITERATIONS=1
 
 Never commit `backend/.env`. It contains a secret and is ignored by Git.
 
+`OPENAI_API_KEY`/`_MODEL`/`_BASE_URL` are agent 1's (the main coach) key. The
+four other agents each read their own optional `LEARNLOOP_*_API_KEY`/`_MODEL`/
+`_BASE_URL` triplet — see the ["Multi-agent architecture"](#multi-agent-architecture)
+table and the comments in `backend/.env.example`. Leave them blank to run
+everything on one key, or fill in different keys/models per agent to compare
+them against each other.
+
 ## 6. Add the course PDF
 
 Place the book at this exact path and filename:
@@ -268,15 +315,16 @@ adaptive chat, and learning analytics.
 
 Use one of the team accounts on the login screen:
 
-| Username | Password |
-| --- | --- |
-| `natali` | `1234` |
-| `liza` | `1234` |
-| `danya` | `1234` |
-| `andrew` | `1234` |
+| Username | Password | Role |
+| --- | --- | --- |
+| `natali` | `1234` | Student |
+| `liza` | `1234` | Student |
+| `danya` | `1234` | Student |
+| `andrew` | `1234` | Student |
+| `teacher` | `1234` | Teacher — opens the course material agent panel instead of the student workspace. |
 
-Each username has independent learning progress stored locally by the backend.
-These credentials are intentionally hardcoded for the course demo and must not be
+Each student username has independent learning progress stored locally by the
+backend. These credentials are intentionally hardcoded for the course demo and must not be
 used as production authentication.
 
 ## 9. Stop the application

@@ -127,6 +127,15 @@ class LearningMemoryStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_question_generation_logs_user
                     ON question_generation_logs(user_id, created_at);
+                CREATE TABLE IF NOT EXISTS material_ingestion_logs (
+                    id TEXT PRIMARY KEY,
+                    material_id TEXT NOT NULL,
+                    topic_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    generated_count INTEGER NOT NULL,
+                    recalculated_students INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -406,6 +415,38 @@ class LearningMemoryStore:
                     "WHERE user_id = ? ORDER BY created_at, id",
                     (user_id,),
                 ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_material_ingestion(
+        self,
+        *,
+        material_id: str,
+        topic_id: str,
+        title: str,
+        generated_count: int,
+        recalculated_students: int,
+    ) -> str:
+        log_id = "material-log-" + uuid4().hex
+        with self._connection() as connection:
+            connection.execute(
+                "INSERT INTO material_ingestion_logs VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    log_id,
+                    material_id,
+                    topic_id,
+                    title,
+                    generated_count,
+                    recalculated_students,
+                    _now(),
+                ),
+            )
+        return log_id
+
+    def material_ingestion_logs(self) -> List[Dict[str, object]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM material_ingestion_logs ORDER BY created_at, id"
+            ).fetchall()
         return [dict(row) for row in rows]
 
     def reset_user(self, user_id: str) -> None:

@@ -114,6 +114,140 @@ class ApiTests(unittest.TestCase):
             )
             self.assertIsNotNone(payload["current_question"])
 
+    def test_answer_can_be_sent_as_several_queued_messages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository, bank, _, _, agent = build_components(root)
+            settings = Settings(
+                api_key="insert api key here",
+                model="mimo-v2.5-free",
+                base_url="https://opencode.ai/zen/v1",
+                max_agent_steps=12,
+                max_topic_depth=5,
+                max_extra_topic_iterations=1,
+                question_bank_path=bank.path,
+                progress_dir=repository.progress_dir,
+            )
+            client = TestClient(create_app(settings, agent, repository, bank))
+            workspace = client.get("/api/courses/ddia?user_id=student-1").json()
+            question_id = workspace["current_question"]["id"]
+
+            draft_one = client.post(
+                "/api/courses/ddia/messages",
+                json={
+                    "user_id": "student-1",
+                    "question_id": question_id,
+                    "message": "Tail latency is",
+                    "chunk_id": "chunk-1",
+                    "seq": 0,
+                    "finalize": False,
+                },
+            )
+            self.assertEqual(draft_one.status_code, 200)
+            self.assertEqual(
+                draft_one.json()["draft"]["combined"], "Tail latency is"
+            )
+
+            # Simulate the second chunk's request racing ahead of a retry of
+            # the first (same chunk_id) — the retry must not duplicate text,
+            # and delivery order must not matter because seq is authoritative.
+            draft_two = client.post(
+                "/api/courses/ddia/messages",
+                json={
+                    "user_id": "student-1",
+                    "question_id": question_id,
+                    "message": "Tail latency is",
+                    "chunk_id": "chunk-1",
+                    "seq": 0,
+                    "finalize": False,
+                },
+            )
+            self.assertEqual(
+                draft_two.json()["draft"]["combined"], "Tail latency is"
+            )
+
+            final = client.post(
+                "/api/courses/ddia/messages",
+                json={
+                    "user_id": "student-1",
+                    "question_id": question_id,
+                    "message": "the slow end of the distribution.",
+                    "chunk_id": "chunk-2",
+                    "seq": 1,
+                    "finalize": True,
+                },
+            )
+
+            self.assertEqual(final.status_code, 200)
+            payload = final.json()
+            self.assertEqual(payload["analytics"]["questions_answered"], 1)
+            answered = repository.load("student-1")
+            self.assertEqual(
+                answered.attempts[0].student_answer,
+                "Tail latency is\nthe slow end of the distribution.",
+            )
+
+    def test_a_second_finalize_while_one_is_in_flight_is_a_harmless_no_op(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository, bank, _, _, agent = build_components(root)
+            settings = Settings(
+                api_key="insert api key here",
+                model="mimo-v2.5-free",
+                base_url="https://opencode.ai/zen/v1",
+                max_agent_steps=12,
+                max_topic_depth=5,
+                max_extra_topic_iterations=1,
+                question_bank_path=bank.path,
+                progress_dir=repository.progress_dir,
+            )
+            client = TestClient(create_app(settings, agent, repository, bank))
+            workspace = client.get("/api/courses/ddia?user_id=student-1").json()
+            question_id = workspace["current_question"]["id"]
+
+            client.post(
+                "/api/courses/ddia/messages",
+                json={
+                    "user_id": "student-1",
+                    "question_id": question_id,
+                    "message": "Tail latency",
+                    "chunk_id": "chunk-1",
+                    "seq": 0,
+                    "finalize": False,
+                },
+            )
+
+            first = client.post(
+                "/api/courses/ddia/messages",
+                json={
+                    "user_id": "student-1",
+                    "question_id": question_id,
+                    "message": "",
+                    "chunk_id": "chunk-final",
+                    "seq": 1,
+                    "finalize": True,
+                },
+            )
+            self.assertEqual(first.status_code, 200)
+            self.assertEqual(first.json()["analytics"]["questions_answered"], 1)
+
+            # A second finalize for the already-graded question (e.g. the
+            # idle-timeout firing right after an explicit click) must not
+            # error and must not grade a second, empty answer.
+            second = client.post(
+                "/api/courses/ddia/messages",
+                json={
+                    "user_id": "student-1",
+                    "question_id": question_id,
+                    "message": "",
+                    "chunk_id": "chunk-final-2",
+                    "seq": 2,
+                    "finalize": True,
+                },
+            )
+            self.assertEqual(second.status_code, 200)
+            self.assertEqual(second.json()["analytics"]["questions_answered"], 1)
+
     def test_missing_local_pdf_is_reported(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -216,6 +350,60 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(
                 payload["current_question"]["topic"], "reliability"
             )
+
+    def test_teacher_login_role_and_material_publish_flow(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository, bank, _, _, agent = build_components(root)
+            settings = Settings(
+                api_key="insert api key here",
+                model="mimo-v2.5-free",
+                base_url="https://opencode.ai/zen/v1",
+                max_agent_steps=12,
+                max_topic_depth=5,
+                max_extra_topic_iterations=1,
+                question_bank_path=bank.path,
+                progress_dir=repository.progress_dir,
+            )
+            client = TestClient(create_app(settings, agent, repository, bank))
+
+            login_response = client.post(
+                "/api/auth/login",
+                json={"username": "teacher", "password": "1234"},
+            )
+            self.assertEqual(login_response.status_code, 200)
+            self.assertEqual(login_response.json()["role"], "teacher")
+
+            publish_response = client.post(
+                "/api/teacher/materials",
+                json={
+                    "topic_id": "replication",
+                    "topic_title": "Replication",
+                    "title": "Chapter 5: Replication",
+                    "content": "Leader-based replication forwards writes to followers.",
+                    "question_count": 3,
+                },
+            )
+            self.assertEqual(publish_response.status_code, 200)
+            payload = publish_response.json()
+            self.assertEqual(payload["topic_id"], "replication")
+            self.assertEqual(len(payload["generated_questions"]), 3)
+
+            listed = client.get("/api/teacher/materials")
+            self.assertEqual(listed.status_code, 200)
+            self.assertEqual(len(listed.json()), 1)
+
+            workspace = client.get(
+                "/api/courses/ddia?user_id=student-1"
+            ).json()
+            material_ids = {item["id"] for item in workspace["materials"]}
+            self.assertIn(payload["material_id"], material_ids)
+
+            download = client.get(
+                "/api/courses/ddia/materials/%s" % payload["material_id"]
+            )
+            self.assertEqual(download.status_code, 200)
+            self.assertIn("Leader-based replication", download.text)
 
     def test_student_can_request_five_private_questions_at_checkpoint(self):
         with tempfile.TemporaryDirectory() as directory:

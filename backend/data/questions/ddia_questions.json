@@ -1211,5 +1211,71 @@
     ],
     "explanation": "The source defines P95 as the response-time threshold at or below which 95 percent of observed requests complete. This directly addresses a key knowledge gap about misunderstanding latency percentile metrics (P95 specifically).",
     "source": "DDIA Part I, Chapter 1, Describing Performance — P95 is the response-time threshold at or below which 95 percent of observed requests complete."
+  },
+  {
+    "id": "material-d23161984944-q1",
+    "topic": "difference between rabbit and",
+    "difficulty": "easy",
+    "text": "What is a key difference between how rabbits and hares are born?",
+    "expected_concepts": [
+      "Rabbits give birth to hairless, blind kittens",
+      "Hares give birth to furred, active leverets",
+      "Newborn rabbits are helpless",
+      "Newborn hares are more developed"
+    ],
+    "explanation": "According to the source, baby rabbits (kittens or kits) are born without fur and with closed eyes, completely dependent on their mother. In contrast, baby hares (leverets) are born with fur and open eyes, able to move soon after birth, which is essential for their above-ground lifestyle.",
+    "source": "Rabbits and Hares: Key Differences (teacher upload)"
+  },
+  {
+    "id": "material-d23161984944-q2",
+    "topic": "difference between rabbit and",
+    "difficulty": "easy",
+    "text": "What is a key difference in the living spaces of rabbits and hares?",
+    "expected_concepts": [
+      "Rabbits live in underground burrows called warrens",
+      "Hares rest in shallow nests called forms"
+    ],
+    "explanation": "Rabbits are social and dig complex burrow systems underground for protection, whereas hares are solitary and make simple nests on the ground surface.",
+    "source": "Rabbits and Hares: Key Differences (teacher upload)"
+  },
+  {
+    "id": "material-d23161984944-q3",
+    "topic": "difference between rabbit and",
+    "difficulty": "medium",
+    "text": "What is a major difference between how rabbits and hares are born?",
+    "expected_concepts": [
+      "Rabbits are born hairless and with closed eyes",
+      "Hares are born with fur and open eyes",
+      "Hares are more developed at birth"
+    ],
+    "explanation": "According to the passage, baby rabbits (kits) are born without fur and with their eyes closed, requiring complete maternal care, while baby hares (leverets) are born with fur and open eyes, able to move soon after birth.",
+    "source": "Rabbits and Hares: Key Differences (teacher upload)"
+  },
+  {
+    "id": "material-d23161984944-q4",
+    "topic": "difference between rabbit and",
+    "difficulty": "medium",
+    "text": "What are the main differences between rabbits and hares in terms of their living environments and the condition of their newborn offspring?",
+    "expected_concepts": [
+      "Rabbits live in underground burrows while hares rest in forms on the ground.",
+      "Baby rabbits (kits) are born without fur and with closed eyes, while baby hares (leverets) are born with fur and open eyes."
+    ],
+    "explanation": "Rabbits typically live in burrows underground, whereas hares live above ground in shallow forms. Additionally, newborn rabbits are helpless, hairless, and blind, while newborn hares are precocial with fur and open eyes.",
+    "source": "Rabbits and Hares: Key Differences (teacher upload)"
+  },
+  {
+    "id": "material-d23161984944-q5",
+    "topic": "difference between rabbit and",
+    "difficulty": "hard",
+    "text": "Imagine you see a fast-moving animal with long ears and powerful legs darting across an open field without stopping to hide. Based on the information provided, would this animal likely be a rabbit or a hare? Cite at least three specific differences that support your identification.",
+    "expected_concepts": [
+      "Leporidae",
+      "hare physical characteristics",
+      "rabbit physical characteristics",
+      "habitat differences",
+      "behavioral differences"
+    ],
+    "explanation": "The animal is likely a hare because hares have longer legs and ears, are built for speed, and do not dig burrows; they rely on speed to escape predators in open areas. Rabbits are smaller with shorter ears and legs, prefer hiding in burrows, and freeze when threatened. The text states that hares are larger with longer legs and ears, live above ground in forms, and use speed to evade danger.",
+    "source": "Rabbits and Hares: Key Differences (teacher upload)"
   }
 ]

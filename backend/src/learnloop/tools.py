@@ -14,6 +14,7 @@ from .models import (
     ToolResult,
     TopicStatus,
 )
+from .answer_validation_agent import AnswerValidationAgent
 from .memory_store import LearningMemoryStore
 from .context import LearningContext
 from .provider import LearningProvider
@@ -40,6 +41,7 @@ class LearningTools:
         memory_store: Optional[LearningMemoryStore] = None,
         learning_context: Optional[LearningContext] = None,
         question_generation_agent: Optional[AdaptiveQuestionBankAgent] = None,
+        answer_validation_agent: Optional[AnswerValidationAgent] = None,
     ):
         self.repository = repository
         self.question_bank = question_bank
@@ -49,6 +51,9 @@ class LearningTools:
         self.memory_store = memory_store
         self.learning_context = learning_context
         self.question_generation_agent = question_generation_agent
+        self.answer_validation_agent = answer_validation_agent or AnswerValidationAgent(
+            provider
+        )
 
     def _persist_learning_memory(
         self,
@@ -137,7 +142,9 @@ class LearningTools:
                 self.learning_context.push(user_id, question)
                 if self.learning_context else ""
             )
-            assessment = self.provider.assess(question, student_answer, push_context)
+            assessment = self.answer_validation_agent.validate(
+                question, student_answer, push_context
+            )
         except Exception as exc:
             return ToolResult.error("ASSESSMENT_FAILED", str(exc))
 

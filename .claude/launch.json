@@ -1,0 +1,18 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "learnloop-backend",
+      "runtimeExecutable": ".venv/bin/uvicorn",
+      "runtimeArgs": ["learnloop.api:app", "--app-dir", "backend/src", "--host", "127.0.0.1", "--port", "8000"],
+      "port": 8000
+    },
+    {
+      "name": "learnloop-frontend",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--", "--host", "127.0.0.1", "--port", "5173"],
+      "cwd": "frontend",
+      "port": 5173
+    }
+  ]
+}

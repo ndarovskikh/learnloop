@@ -2,17 +2,21 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from .agent import AgentLoop
 from .analytics import build_analytics
+from .answer_queue import AnswerDraftQueue
 from .app import build_agent
 from .config import Settings
+from .material_agent import CourseMaterialAgent
 from .models import CheckpointDecision, Question, TopicStatus
+from .provider import build_provider
 from .question_bank import QuestionBank
 from .repository import ProgressRepository
 from .admin_agent import AdminStatisticsAgent
@@ -43,7 +47,9 @@ DEMO_ACCOUNTS = {
     "liza": "1234",
     "danya": "1234",
     "andrew": "1234",
+    "teacher": "1234",
 }
+TEACHER_ACCOUNTS = {"teacher"}
 
 
 class LoginRequest(BaseModel):
@@ -54,7 +60,15 @@ class LoginRequest(BaseModel):
 class ChatRequest(BaseModel):
     user_id: str = Field(min_length=1, max_length=80)
     question_id: str = Field(min_length=1, max_length=120)
-    message: str = Field(min_length=1, max_length=10000)
+    message: str = Field(default="", max_length=10000)
+    # Multi-message answers: each chat send is one chunk of a still-open
+    # answer. chunk_id de-duplicates retried requests; seq orders chunks
+    # correctly even if two requests race and arrive out of order; finalize
+    # tells the server "grade whatever has been drafted so far now" — until
+    # then, chunks are only queued, never graded.
+    chunk_id: Optional[str] = Field(default=None, max_length=80)
+    seq: int = 0
+    finalize: bool = True
 
 
 class CheckpointRequest(BaseModel):
@@ -85,6 +99,14 @@ class AdminBenchmarkRequest(BaseModel):
     topic: Optional[str] = Field(default=None, min_length=1, max_length=120)
 
 
+class TeacherMaterialRequest(BaseModel):
+    topic_id: str = Field(min_length=1, max_length=80)
+    topic_title: str = Field(min_length=1, max_length=160)
+    title: str = Field(min_length=1, max_length=160)
+    content: str = Field(min_length=1, max_length=50000)
+    question_count: int = Field(default=5, ge=1, le=10)
+
+
 def _question_payload(question: Optional[Question]) -> Optional[Dict[str, Any]]:
     return question.to_dict() if question else None
 
@@ -99,12 +121,52 @@ def create_app(
     repository = repository or ProgressRepository(settings.progress_dir)
     question_bank = question_bank or QuestionBank(settings.question_bank_path)
     agent = agent or build_agent(settings)
-    admin_agent = None
+    memory_store = None
     if settings.memory_db_path and settings.memory_jsonl_path:
-        admin_agent = AdminStatisticsAgent(
-            LearningMemoryStore(settings.memory_db_path, settings.memory_jsonl_path)
+        memory_store = LearningMemoryStore(
+            settings.memory_db_path, settings.memory_jsonl_path
         )
+    # Agent 4 — Danya, the superior/statistics agent. Its aggregate percentile
+    # is deliberately computed by deterministic SQL, not by an LLM, so a
+    # crafted prompt cannot widen what it discloses; see
+    # docs/admin-agent-boundary.md. Its reserved key (LEARNLOOP_SUPERIOR_*)
+    # is not called for that reason.
+    admin_agent = AdminStatisticsAgent(memory_store) if memory_store else None
     agent.admin_agent = admin_agent
+
+    # Agent 5 — Natali: wakes up when a teacher publishes new material.
+    materials_dir = settings.materials_dir or settings.progress_dir.parent / "materials"
+    material_credentials = settings.agent_credentials("material_agent")
+    material_provider = build_provider(
+        api_key=material_credentials.api_key,
+        model=material_credentials.model,
+        base_url=material_credentials.base_url,
+    )
+    # One draft queue per app instance — same process-local lifetime as
+    # `agent`/`repository` above. See answer_queue.py for the concurrency
+    # guarantees (chunk ordering, dedup, single-grading-per-question).
+    draft_queue = AnswerDraftQueue()
+
+    material_agent = CourseMaterialAgent(
+        materials_dir=materials_dir,
+        question_bank=question_bank,
+        provider=material_provider,
+        repository=repository,
+        memory_store=memory_store,
+    )
+
+    def all_materials() -> List[Dict[str, Any]]:
+        uploaded = [
+            {
+                "id": item["id"],
+                "title": item["title"],
+                "filename": item["filename"],
+                "type": "Article",
+                "status": "Teacher upload",
+            }
+            for item in material_agent.list_materials()
+        ]
+        return MATERIALS + uploaded
 
     app = FastAPI(
         title="LearnLoop API",
@@ -213,7 +275,7 @@ def create_app(
 
         return {
             "course": COURSE,
-            "materials": MATERIALS,
+            "materials": all_materials(),
             "analytics": build_analytics(
                 progress,
                 question_bank,
@@ -255,6 +317,38 @@ def create_app(
         return {
             "user_id": username,
             "display_name": username.capitalize(),
+            "role": "teacher" if username in TEACHER_ACCOUNTS else "student",
+        }
+
+    @app.get("/api/teacher/materials")
+    def teacher_materials() -> List[Dict[str, Any]]:
+        return material_agent.list_materials()
+
+    @app.post("/api/teacher/materials")
+    def publish_material(
+        request: TeacherMaterialRequest,
+        x_teacher_token: Optional[str] = Header(default=None),
+    ) -> Dict[str, Any]:
+        if settings.teacher_token and x_teacher_token != settings.teacher_token:
+            raise HTTPException(status_code=403, detail="Teacher access required")
+        try:
+            result = material_agent.ingest_material(
+                topic_id=request.topic_id,
+                topic_title=request.topic_title,
+                title=request.title,
+                content=request.content,
+                question_count=request.question_count,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {
+            "material_id": result.material_id,
+            "topic_id": result.topic_id,
+            "title": result.title,
+            "generated_questions": [
+                item.to_dict() for item in result.generated_questions
+            ],
+            "recalculated_students": result.recalculated_students,
         }
 
     @app.get("/api/courses")
@@ -268,7 +362,7 @@ def create_app(
                     question_bank,
                     settings.max_topic_depth,
                 ),
-                "materials_count": len(MATERIALS),
+                "materials_count": len(all_materials()),
             }
         ]
 
@@ -293,12 +387,40 @@ def create_app(
                 ]
             )
             return workspace
-        result = agent.submit_answer(
+
+        chunk_id = request.chunk_id or uuid4().hex
+        combined_so_far = draft_queue.append(
             user_id=request.user_id,
             question_id=request.question_id,
-            student_answer=request.message,
+            chunk_id=chunk_id,
+            seq=request.seq,
+            text=request.message,
         )
+
+        if not request.finalize:
+            # Queue this chunk only — no grading yet, agent 2 is not called.
+            return {"draft": {"question_id": request.question_id, "combined": combined_so_far}}
+
+        combined = draft_queue.begin_finalize(request.user_id, request.question_id)
+        if combined is None:
+            # Nothing drafted, or another finalize for this question is
+            # already being graded (idle-timeout and an explicit click
+            # racing, a retried request, ...). Treat it as a harmless no-op
+            # instead of grading twice or erroring — the in-flight finalize
+            # owns this question and will return the real result.
+            return course_workspace(request.user_id)
+
+        try:
+            result = agent.submit_answer(
+                user_id=request.user_id,
+                question_id=request.question_id,
+                student_answer=combined,
+            )
+        except Exception:
+            draft_queue.cancel_finalize(request.user_id, request.question_id)
+            raise
         if result.status == "failed":
+            draft_queue.cancel_finalize(request.user_id, request.question_id)
             raise HTTPException(
                 status_code=422,
                 detail={
@@ -306,6 +428,7 @@ def create_app(
                     "message": result.message,
                 },
             )
+        draft_queue.clear(request.user_id, request.question_id)
         return course_workspace(request.user_id)
 
     @app.post("/api/courses/{course_id}/checkpoint")
@@ -415,19 +538,22 @@ def create_app(
     @app.get("/api/courses/{course_id}/materials/{material_id}")
     def material(course_id: str, material_id: str):
         require_course(course_id)
-        if material_id != "ddia-book":
-            raise HTTPException(status_code=404, detail="Material not found")
-        path = settings.progress_dir.parent / "materials" / "ddia.pdf"
-        if not path.exists():
-            raise HTTPException(
-                status_code=404,
-                detail="Put ddia.pdf into backend/data/materials/",
+        if material_id == "ddia-book":
+            path = settings.progress_dir.parent / "materials" / "ddia.pdf"
+            if not path.exists():
+                raise HTTPException(
+                    status_code=404,
+                    detail="Put ddia.pdf into backend/data/materials/",
+                )
+            return FileResponse(
+                path=Path(path),
+                media_type="application/pdf",
+                filename="ddia.pdf",
             )
-        return FileResponse(
-            path=Path(path),
-            media_type="application/pdf",
-            filename="ddia.pdf",
-        )
+        content = material_agent.read_material(material_id)
+        if content is None:
+            raise HTTPException(status_code=404, detail="Material not found")
+        return PlainTextResponse(content, media_type="text/markdown")
 
     return app
 

@@ -83,3 +83,14 @@ export function selectLearningTopic(courseId, payload) {
 export function materialUrl(courseId, materialId) {
   return `${API_URL}/api/courses/${courseId}/materials/${materialId}`;
 }
+
+export function listTeacherMaterials() {
+  return request("/api/teacher/materials");
+}
+
+export function publishMaterial(payload) {
+  return request("/api/teacher/materials", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
