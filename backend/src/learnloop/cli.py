@@ -76,7 +76,29 @@ def main() -> None:
     parser.add_argument("--user", default="demo-student")
     parser.add_argument("--memory-demo", action="store_true", help="run the SQLite/JSON memory example")
     parser.add_argument("--memory-status", action="store_true", help="show saved memory statistics for the user")
+    parser.add_argument(
+        "--generate-nightly-questions",
+        action="store_true",
+        help="generate private practice questions from SQLite progress",
+    )
     args = parser.parse_args()
+    if args.generate_nightly_questions:
+        settings = Settings.load()
+        agent = build_agent(settings)
+        generator = agent.registry.tools.question_generation_agent
+        if generator is None:
+            parser.error("SQLite learning memory is required")
+        results = generator.run_nightly()
+        generated = [result for result in results if result.status == "generated"]
+        if generated:
+            print(
+                "Generated %d private questions for %d student(s)."
+                % (
+                    sum(len(result.questions) for result in generated),
+                    len(generated),
+                )
+            )
+        return
     if args.memory_demo:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

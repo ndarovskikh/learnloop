@@ -15,8 +15,10 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, List
+from typing import Dict, Iterable, List, Optional
 from uuid import uuid4
+
+from .models import Difficulty, Question
 
 
 def _now() -> str:
@@ -98,6 +100,33 @@ class LearningMemoryStore:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (user_id, topic_id)
                 );
+                CREATE TABLE IF NOT EXISTS personal_questions (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    topic_id TEXT NOT NULL,
+                    difficulty TEXT NOT NULL,
+                    question_text TEXT NOT NULL,
+                    expected_concepts TEXT NOT NULL,
+                    explanation TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    generation_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_personal_questions_owner_topic
+                    ON personal_questions(user_id, topic_id, created_at);
+                CREATE TABLE IF NOT EXISTS question_generation_logs (
+                    id TEXT PRIMARY KEY,
+                    trigger TEXT NOT NULL,
+                    user_id TEXT,
+                    status TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    course_completion REAL NOT NULL,
+                    topic_id TEXT,
+                    generated_count INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_question_generation_logs_user
+                    ON question_generation_logs(user_id, created_at);
                 """
             )
 
@@ -186,11 +215,207 @@ class LearningMemoryStore:
                 "SELECT COUNT(*) FROM attempts WHERE user_id = ?", (user_id,)
             ).fetchone()[0])
 
+    def users_with_attempts(self) -> List[str]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT DISTINCT user_id FROM attempts ORDER BY user_id"
+            ).fetchall()
+        return [str(row["user_id"]) for row in rows]
+
+    def question_generation_progress(
+        self,
+        user_id: str,
+        total_required_questions: int,
+        topic_id: Optional[str] = None,
+    ) -> Dict[str, object]:
+        """Read completion and knowledge gaps only from durable SQLite data."""
+        if total_required_questions < 1:
+            raise ValueError("total_required_questions must be positive")
+        with self._connection() as connection:
+            attempt_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM attempts WHERE user_id = ?",
+                    (user_id,),
+                ).fetchone()[0]
+            )
+            if topic_id:
+                topic = connection.execute(
+                    "SELECT q.topic_id, COUNT(*) AS attempt_count, AVG(a.score) AS mastery "
+                    "FROM attempts a JOIN questions q ON q.id = a.question_id "
+                    "WHERE a.user_id = ? AND q.topic_id = ? GROUP BY q.topic_id",
+                    (user_id, topic_id),
+                ).fetchone()
+            else:
+                topic = connection.execute(
+                    "SELECT q.topic_id, COUNT(*) AS attempt_count, AVG(a.score) AS mastery "
+                    "FROM attempts a JOIN questions q ON q.id = a.question_id "
+                    "WHERE a.user_id = ? GROUP BY q.topic_id "
+                    "ORDER BY mastery ASC, attempt_count DESC, q.topic_id ASC LIMIT 1",
+                    (user_id,),
+                ).fetchone()
+
+            selected_topic = str(topic["topic_id"]) if topic is not None else topic_id
+            gap_rows = []
+            if selected_topic:
+                gap_rows = connection.execute(
+                    "SELECT q.expected_answer FROM attempts a "
+                    "JOIN questions q ON q.id = a.question_id "
+                    "WHERE a.user_id = ? AND q.topic_id = ? "
+                    "ORDER BY a.score ASC, a.created_at DESC LIMIT 5",
+                    (user_id, selected_topic),
+                ).fetchall()
+
+        gaps: List[str] = []
+        for row in gap_rows:
+            for concept in str(row["expected_answer"]).split(";"):
+                normalized = concept.strip()
+                if normalized and normalized not in gaps:
+                    gaps.append(normalized)
+        return {
+            "user_id": user_id,
+            "attempt_count": attempt_count,
+            "course_completion": min(
+                attempt_count / total_required_questions * 100.0,
+                100.0,
+            ),
+            "topic": selected_topic,
+            "topic_attempt_count": int(topic["attempt_count"]) if topic else 0,
+            "mastery": float(topic["mastery"]) if topic else 0.0,
+            "knowledge_gaps": gaps,
+        }
+
+    def add_personal_question(
+        self,
+        user_id: str,
+        question: Question,
+        generation_id: str,
+    ) -> None:
+        self.add_personal_questions(user_id, [question], generation_id)
+
+    def add_personal_questions(
+        self,
+        user_id: str,
+        questions: Iterable[Question],
+        generation_id: str,
+    ) -> None:
+        timestamp = _now()
+        rows = [
+            (
+                question.id,
+                user_id,
+                question.topic,
+                question.difficulty.value,
+                question.text,
+                json.dumps(question.expected_concepts, ensure_ascii=False),
+                question.explanation,
+                question.source,
+                generation_id,
+                timestamp,
+            )
+            for question in questions
+        ]
+        with self._connection() as connection:
+            connection.executemany(
+                "INSERT INTO personal_questions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+
+    @staticmethod
+    def _personal_question_from_row(row: sqlite3.Row) -> Question:
+        return Question(
+            id=str(row["id"]),
+            topic=str(row["topic_id"]),
+            difficulty=Difficulty(str(row["difficulty"])),
+            text=str(row["question_text"]),
+            expected_concepts=[
+                str(item) for item in json.loads(row["expected_concepts"])
+            ],
+            explanation=str(row["explanation"]),
+            source=str(row["source"]),
+        )
+
+    def personal_question_for(self, user_id: str, question_id: str) -> Question:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM personal_questions WHERE user_id = ? AND id = ?",
+                (user_id, question_id),
+            ).fetchone()
+        if row is None:
+            raise KeyError(question_id)
+        return self._personal_question_from_row(row)
+
+    def find_unused_personal_question(
+        self,
+        user_id: str,
+        topic_id: str,
+        excluded_ids: Iterable[str],
+    ) -> Optional[Question]:
+        excluded = set(excluded_ids)
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM personal_questions "
+                "WHERE user_id = ? AND topic_id = ? ORDER BY created_at ASC, id ASC",
+                (user_id, topic_id),
+            ).fetchall()
+        for row in rows:
+            if str(row["id"]) not in excluded:
+                return self._personal_question_from_row(row)
+        return None
+
+    def record_question_generation_decision(
+        self,
+        *,
+        trigger: str,
+        user_id: Optional[str],
+        status: str,
+        reason: str,
+        course_completion: float,
+        topic_id: Optional[str],
+        generated_count: int,
+    ) -> str:
+        decision_id = "generation-log-" + uuid4().hex
+        with self._connection() as connection:
+            connection.execute(
+                "INSERT INTO question_generation_logs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    decision_id,
+                    trigger,
+                    user_id,
+                    status,
+                    reason,
+                    course_completion,
+                    topic_id,
+                    generated_count,
+                    _now(),
+                ),
+            )
+        return decision_id
+
+    def question_generation_logs(
+        self,
+        user_id: Optional[str] = None,
+    ) -> List[Dict[str, object]]:
+        with self._connection() as connection:
+            if user_id is None:
+                rows = connection.execute(
+                    "SELECT * FROM question_generation_logs ORDER BY created_at, id"
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM question_generation_logs "
+                    "WHERE user_id = ? ORDER BY created_at, id",
+                    (user_id,),
+                ).fetchall()
+        return [dict(row) for row in rows]
+
     def reset_user(self, user_id: str) -> None:
         with self._connection() as connection:
             connection.execute("DELETE FROM attempts WHERE user_id = ?", (user_id,))
             connection.execute("DELETE FROM mastery WHERE user_id = ?", (user_id,))
             connection.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            connection.execute(
+                "DELETE FROM personal_questions WHERE user_id = ?", (user_id,)
+            )
         self._rewrite_memories(
             memory for memory in self.memories_for_all() if memory.user_id != user_id
         )
@@ -204,6 +429,10 @@ class LearningMemoryStore:
             )
             connection.execute(
                 "DELETE FROM mastery WHERE user_id = ? AND topic_id = ?",
+                (user_id, topic_id),
+            )
+            connection.execute(
+                "DELETE FROM personal_questions WHERE user_id = ? AND topic_id = ?",
                 (user_id, topic_id),
             )
         self._rewrite_memories(

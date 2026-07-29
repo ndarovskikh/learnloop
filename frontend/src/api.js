@@ -52,6 +52,13 @@ export function resolveCheckpoint(courseId, payload) {
   });
 }
 
+export function generatePracticeQuestions(courseId, payload) {
+  return request(`/api/courses/${courseId}/practice-questions`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
 export function resetAllProgress(courseId, payload) {
   return request(`/api/courses/${courseId}/reset`, {
     method: "POST",

@@ -112,6 +112,30 @@ default, is not available to the ordinary coaching tools, and refuses cohorts
 smaller than two. The full privacy boundary is in
 [`docs/admin-agent-boundary.md`](docs/admin-agent-boundary.md).
 
+### Personal question-bank agent
+
+After a student completes at least 5% of the course, LearnLoop can generate a
+private batch of five practice questions from that student's SQLite progress
+and weakest knowledge area. At the topic checkpoint the student can request
+the batch with **Generate 5 practice questions**. These questions are stored in
+SQLite and cannot be served to another student.
+
+The same agent can be called once a night by the system cron. For a 03:00 run
+in mainland Spain, add this to the crontab (adjust the project and Python paths):
+
+```cron
+CRON_TZ=Europe/Madrid
+0 3 * * * cd /path/to/learnloop && /path/to/python -m learnloop --generate-nightly-questions
+```
+
+`Europe/Madrid` automatically follows CET/CEST (UTC+1/UTC+2). To use the
+machine's configured local time instead, omit `CRON_TZ`.
+
+When nobody has progress, or a student's course completion is below 5%, the
+nightly command intentionally writes nothing to stdout and exits successfully.
+The decision is still recorded in SQLite table `question_generation_logs` with
+status `silent`, the reason, completion value, trigger, and timestamp.
+
 ## 3. Install all backend dependencies
 
 Create an isolated Python environment:

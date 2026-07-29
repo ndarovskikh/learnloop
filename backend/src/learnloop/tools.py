@@ -18,6 +18,10 @@ from .memory_store import LearningMemoryStore
 from .context import LearningContext
 from .provider import LearningProvider
 from .question_bank import QuestionBank
+from .question_generation_agent import (
+    AdaptiveQuestionBankAgent,
+    QuestionGenerationTrigger,
+)
 from .repository import ProgressRepository
 
 
@@ -35,6 +39,7 @@ class LearningTools:
         max_extra_iterations: int = 1,
         memory_store: Optional[LearningMemoryStore] = None,
         learning_context: Optional[LearningContext] = None,
+        question_generation_agent: Optional[AdaptiveQuestionBankAgent] = None,
     ):
         self.repository = repository
         self.question_bank = question_bank
@@ -43,6 +48,7 @@ class LearningTools:
         self.max_extra_iterations = max_extra_iterations
         self.memory_store = memory_store
         self.learning_context = learning_context
+        self.question_generation_agent = question_generation_agent
 
     def _persist_learning_memory(
         self,
@@ -98,7 +104,15 @@ class LearningTools:
         if not student_answer.strip():
             return ToolResult.error("EMPTY_ANSWER", "Student answer must not be empty")
         try:
-            question = self.question_bank.get(question_id)
+            try:
+                question = self.question_bank.get(question_id)
+            except KeyError:
+                if self.question_generation_agent is None:
+                    raise
+                question = self.question_generation_agent.personal_question_for(
+                    user_id,
+                    question_id,
+                )
             progress = self.repository.load(user_id)
         except KeyError:
             return ToolResult.error(
@@ -153,7 +167,20 @@ class LearningTools:
         progress.recalculate_mastery()
         new_mastery = progress.mastery[question.topic]
 
-        checkpoint_required = progress.topic_depth >= self.max_topic_depth
+        personal_question_remaining = (
+            self.question_generation_agent.find_unused_question(
+                user_id,
+                question.topic,
+                progress.answered_question_ids,
+            )
+            if self.question_generation_agent is not None
+            and progress.topic_depth >= self.max_topic_depth
+            else None
+        )
+        checkpoint_required = (
+            progress.topic_depth >= self.max_topic_depth
+            and personal_question_remaining is None
+        )
         if checkpoint_required:
             progress.topic_status = TopicStatus.MASTERY_CONFIRMATION_REQUIRED
 
@@ -211,11 +238,24 @@ class LearningTools:
             )
 
         try:
-            question = self.question_bank.find_unused(
-                topic=topic,
-                difficulty=difficulty,
-                excluded_ids=progress.answered_question_ids,
-            )
+            question = None
+            personal = False
+            if (
+                self.question_generation_agent is not None
+                and progress.topic_depth >= self.max_topic_depth
+            ):
+                question = self.question_generation_agent.find_unused_question(
+                    user_id,
+                    topic,
+                    progress.answered_question_ids,
+                )
+                personal = question is not None
+            if question is None:
+                question = self.question_bank.find_unused(
+                    topic=topic,
+                    difficulty=difficulty,
+                    excluded_ids=progress.answered_question_ids,
+                )
             generated = False
             if question is None:
                 related = [
@@ -262,6 +302,47 @@ class LearningTools:
             {
                 "question": question.to_dict(),
                 "generated": generated,
+                "personal": personal,
+            }
+        )
+
+    def generate_personal_practice_questions(
+        self,
+        user_id: str,
+    ) -> ToolResult:
+        if self.question_generation_agent is None:
+            return ToolResult.error(
+                "PERSONAL_QUESTION_AGENT_UNAVAILABLE",
+                "Personal question generation requires SQLite learning memory",
+            )
+        try:
+            progress = self.repository.load(user_id)
+            result = self.question_generation_agent.generate_for_user(
+                user_id=user_id,
+                trigger=QuestionGenerationTrigger.USER_REQUEST,
+                topic=progress.active_topic,
+            )
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            return ToolResult.error("PERSONAL_QUESTION_GENERATION_FAILED", str(exc))
+        except Exception as exc:
+            return ToolResult.error("PROVIDER_QUESTION_FAILED", str(exc))
+
+        if result.status != "generated":
+            return ToolResult.error(
+                "PERSONAL_QUESTION_GENERATION_REJECTED",
+                result.reason,
+            )
+        progress.topic_status = TopicStatus.IN_PROGRESS
+        try:
+            self.repository.save(progress)
+        except (OSError, ValueError) as exc:
+            return ToolResult.error("PROGRESS_WRITE_FAILED", str(exc))
+        return ToolResult.ok(
+            {
+                "generated_count": len(result.questions),
+                "topic": result.topic,
+                "decision_id": result.decision_id,
+                "questions": [question.to_dict() for question in result.questions],
             }
         )
 
@@ -412,6 +493,9 @@ class ToolRegistry:
         "generate_next_question": {
             "required": ["user_id", "topic", "difficulty", "knowledge_gaps"],
         },
+        "generate_personal_practice_questions": {
+            "required": ["user_id"],
+        },
         "resolve_topic_checkpoint": {
             "required": ["user_id", "decision"],
         },
@@ -460,6 +544,10 @@ class ToolRegistry:
                     knowledge_gaps=[
                         str(item) for item in arguments["knowledge_gaps"]
                     ],
+                )
+            if name == "generate_personal_practice_questions":
+                return self.tools.generate_personal_practice_questions(
+                    user_id=str(arguments["user_id"]),
                 )
             if name == "resolve_topic_checkpoint":
                 return self.tools.resolve_topic_checkpoint(

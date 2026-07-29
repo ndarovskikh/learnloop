@@ -6,6 +6,9 @@ from fastapi.testclient import TestClient
 
 from learnloop.api import create_app
 from learnloop.config import Settings
+from learnloop.memory_store import LearningMemoryStore
+from learnloop.provider import HeuristicProvider
+from learnloop.question_generation_agent import AdaptiveQuestionBankAgent
 
 from helpers import build_components, question
 
@@ -212,6 +215,57 @@ class ApiTests(unittest.TestCase):
             )
             self.assertEqual(
                 payload["current_question"]["topic"], "reliability"
+            )
+
+    def test_student_can_request_five_private_questions_at_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository, bank, tools, _, agent = build_components(root, count=5)
+            database_path = root / "learnloop.sqlite3"
+            memories_path = root / "memories.jsonl"
+            store = LearningMemoryStore(database_path, memories_path)
+            tools.memory_store = store
+            tools.question_generation_agent = AdaptiveQuestionBankAgent(
+                store,
+                bank,
+                HeuristicProvider(),
+            )
+            for index in range(1, 6):
+                tools.assess_and_record_answer(
+                    "student-1",
+                    "q-%s" % index,
+                    "Tail latency",
+                )
+            settings = Settings(
+                api_key="insert api key here",
+                model="mimo-v2.5-free",
+                base_url="https://opencode.ai/zen/v1",
+                max_agent_steps=12,
+                max_topic_depth=5,
+                max_extra_topic_iterations=1,
+                question_bank_path=bank.path,
+                progress_dir=repository.progress_dir,
+                memory_db_path=database_path,
+                memory_jsonl_path=memories_path,
+            )
+            client = TestClient(create_app(settings, agent, repository, bank))
+
+            response = client.post(
+                "/api/courses/ddia/practice-questions",
+                json={"user_id": "student-1"},
+            )
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertIsNone(payload["checkpoint"])
+            self.assertTrue(
+                payload["current_question"]["id"].startswith("personal-")
+            )
+            self.assertEqual(
+                store.question_generation_logs("student-1")[-1][
+                    "generated_count"
+                ],
+                5,
             )
 
 
