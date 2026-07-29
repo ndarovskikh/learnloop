@@ -316,3 +316,18 @@ npm run build
 LearnLoop is an adaptive AI learning coach. It checks a student's answers,
 saves progress, identifies knowledge gaps, and adapts the next question. The
 current demo course is based on *Designing Data-Intensive Applications*.
+
+## Answer verifier agent
+
+Every submitted answer goes through two separate AI roles. The assessment
+executor prepares a rubric-based draft; an independent answer verifier checks
+that draft against the question rubric and returns the final correctness score
+(shown to the learner as a percentage) and feedback. Progress is written only
+after the verifier returns `status: "verified"`.
+
+They exchange a small structured hand-off with `status`, `result`, and
+`needs_approval`, and use an append-only shared memory at
+`progress/agent_coordination.jsonl`. This makes each assessment traceable
+without allowing the verifier to modify learner progress. The verifier's full
+delegation brief and coordination rationale are in
+[`docs/answer_verifier_design.md`](docs/answer_verifier_design.md).

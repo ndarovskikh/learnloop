@@ -4,11 +4,21 @@ import hashlib
 import json
 from typing import Any, Dict, List, Protocol, Optional
 
+from .coordination import AgentHandoff
 from .models import Assessment, Difficulty, Question
 
 
 class LearningProvider(Protocol):
     def assess(self, question: Question, student_answer: str, context: str = "") -> Assessment:
+        ...
+
+    def verify_assessment(
+        self,
+        question: Question,
+        student_answer: str,
+        proposal: AgentHandoff,
+        context: str = "",
+    ) -> AgentHandoff:
         ...
 
     def generate_question(
@@ -60,6 +70,20 @@ class HeuristicProvider:
             knowledge_gaps=gaps,
             recommended_difficulty=_difficulty_for_score(score),
         )
+
+    def verify_assessment(
+        self,
+        question: Question,
+        student_answer: str,
+        proposal: AgentHandoff,
+        context: str = "",
+    ) -> AgentHandoff:
+        if proposal.status != "assessment_proposed" or proposal.needs_approval:
+            return AgentHandoff("rejected", {"reason": "Invalid assessment proposal"})
+        # This role recalculates from the rubric instead of trusting the
+        # executor's score, so it remains an independent deterministic check.
+        verified = self.assess(question, student_answer, context)
+        return AgentHandoff("verified", {"assessment": verified.to_dict()})
 
     def generate_question(
         self,
@@ -145,6 +169,44 @@ class OpenAIProvider:
             knowledge_gaps=assessment.knowledge_gaps,
             recommended_difficulty=_difficulty_for_score(assessment.score),
         )
+
+    def verify_assessment(
+        self,
+        question: Question,
+        student_answer: str,
+        proposal: AgentHandoff,
+        context: str = "",
+    ) -> AgentHandoff:
+        if proposal.status != "assessment_proposed" or proposal.needs_approval:
+            return AgentHandoff("rejected", {"reason": "Invalid assessment proposal"})
+        payload = self._json_call(
+            system=(
+                "You are the independent answer-verification agent. Check the "
+                "executor proposal against only the supplied rubric. Correct it "
+                "where needed. Return JSON with question_id, score (0..1), "
+                "feedback, knowledge_gaps (array), and recommended_difficulty "
+                "(easy|medium|hard). Feedback must be constructive and address "
+                "the learner directly.\n\n" + context
+            ),
+            user=json.dumps(
+                {
+                    "question": question.to_dict(),
+                    "student_answer": student_answer,
+                    "executor_proposal": proposal.to_dict(),
+                },
+                ensure_ascii=False,
+            ),
+        )
+        payload["question_id"] = question.id
+        assessment = Assessment.from_dict(payload)
+        final = Assessment(
+            question_id=assessment.question_id,
+            score=assessment.score,
+            feedback=assessment.feedback,
+            knowledge_gaps=assessment.knowledge_gaps,
+            recommended_difficulty=_difficulty_for_score(assessment.score),
+        )
+        return AgentHandoff("verified", {"assessment": final.to_dict()})
 
     def generate_question(
         self,

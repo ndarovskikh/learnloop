@@ -113,6 +113,7 @@ def create_app(
             "http://localhost:5173",
             "http://127.0.0.1:5173",
         ],
+        allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1):\d+$",
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -183,6 +184,7 @@ def create_app(
                         "role": "assistant",
                         "content": attempt.feedback,
                         "score": round(attempt.score * 100),
+                        "verified_by": "AI answer verifier",
                     },
                 ]
             )
