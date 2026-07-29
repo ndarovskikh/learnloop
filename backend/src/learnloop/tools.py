@@ -5,6 +5,7 @@ import logging
 import sqlite3
 from typing import Any, Dict, List, Optional
 
+from .coordination import AgentHandoff, CoordinationMemory
 from .models import (
     Assessment,
     Attempt,
@@ -43,6 +44,7 @@ class LearningTools:
         self.max_extra_iterations = max_extra_iterations
         self.memory_store = memory_store
         self.learning_context = learning_context
+        self.coordination_memory = CoordinationMemory(repository.progress_dir)
 
     def _persist_learning_memory(
         self,
@@ -123,7 +125,44 @@ class LearningTools:
                 self.learning_context.push(user_id, question)
                 if self.learning_context else ""
             )
-            assessment = self.provider.assess(question, student_answer, push_context)
+            # Executor proposes an assessment. It cannot write learner progress.
+            proposal = AgentHandoff(
+                status="assessment_proposed",
+                result={
+                    "assessment": self.provider.assess(
+                        question,
+                        student_answer,
+                        push_context,
+                    ).to_dict()
+                },
+            )
+            self.coordination_memory.append("assessment_executor", proposal)
+            if proposal.status != "assessment_proposed" or proposal.needs_approval:
+                return ToolResult.error(
+                    "ASSESSMENT_APPROVAL_REQUIRED",
+                    "The assessment proposal requires review before saving.",
+                )
+
+            # The verifier receives only the structured proposal and independently
+            # checks it against the question rubric. Persistence is gated on it.
+            verification = self.provider.verify_assessment(
+                question,
+                student_answer,
+                proposal,
+                push_context,
+            )
+            self.coordination_memory.append("answer_verifier", verification)
+            if verification.needs_approval:
+                return ToolResult.error(
+                    "VERIFICATION_APPROVAL_REQUIRED",
+                    "The answer verifier requested human review.",
+                )
+            if verification.status != "verified":
+                return ToolResult.error(
+                    "ASSESSMENT_REJECTED",
+                    str(verification.result.get("reason", "Verifier rejected assessment")),
+                )
+            assessment = Assessment.from_dict(verification.result["assessment"])
         except Exception as exc:
             return ToolResult.error("ASSESSMENT_FAILED", str(exc))
 

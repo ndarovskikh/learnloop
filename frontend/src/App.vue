@@ -488,7 +488,7 @@ function openMaterial(material) {
                 {{ message.content }}
               </p>
               <span v-if="message.score !== undefined" class="score-badge">
-                Score {{ message.score }}%
+                {{ message.verified_by || "Score" }}: {{ message.score }}% correct
               </span>
             </div>
           </article>

@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import json
 from pathlib import Path
 
 from learnloop.models import CheckpointDecision, Difficulty, TopicStatus
@@ -38,6 +39,18 @@ class LearningToolsTests(unittest.TestCase):
             self.assertEqual(progress.topic_depth, 1)
             self.assertIn("q-1", progress.answered_question_ids)
             self.assertEqual(len(progress.attempts), 1)
+            audit_path = Path(directory) / "progress" / "agent_coordination.jsonl"
+            records = [
+                json.loads(line)
+                for line in audit_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(
+                [record["role"] for record in records],
+                ["assessment_executor", "answer_verifier"],
+            )
+            self.assertEqual(records[0]["handoff"]["status"], "assessment_proposed")
+            self.assertEqual(records[1]["handoff"]["status"], "verified")
+            self.assertFalse(records[1]["handoff"]["needs_approval"])
 
     def test_assessment_is_also_written_to_structured_memory(self):
         with tempfile.TemporaryDirectory() as directory:
